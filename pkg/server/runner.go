@@ -23,6 +23,7 @@ import (
 	"github.com/llm-d/llm-d-async/pkg/plugins"
 	"github.com/llm-d/llm-d-async/pkg/pubsub"
 	"github.com/llm-d/llm-d-async/pkg/redis"
+	"github.com/llm-d/llm-d-async/pkg/sqlflow"
 	"github.com/llm-d/llm-d-async/pkg/version"
 	"github.com/spf13/pflag"
 	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
@@ -172,7 +173,7 @@ func (r *Runner) Run(ctx context.Context) (err error) {
 			wg.Add(1)
 			go func(mergedChan chan pipeline.EmbelishedRequestMessage, poolGate pipeline.Gate) {
 				defer wg.Done()
-				asyncworker.WorkerWithGate(ctx, drainCtx, flow.Characteristics(), inferenceClient, mergedChan, flow.RetryChannel(), flow.ResultChannel(), opts.Worker.RequestTimeout, transforms, poolGate)
+				asyncworker.WorkerWithGateTimeout(ctx, drainCtx, flow.Characteristics(), inferenceClient, mergedChan, flow.RetryChannel(), flow.ResultChannel(), opts.Worker.RequestTimeout, opts.Worker.GateWaitTimeout, transforms, poolGate)
 			}(mergedChan, poolGate)
 		}
 	}
@@ -314,6 +315,13 @@ func loadFlow(opts *Options, gateFactory *flowcontrol.GateFactory, poolsMap map[
 		}
 		flow, err := redis.NewRedisSortedSetFlow(*cfg, workerPools, gateFactory)
 		return flow, cfg, err
+	case "sql":
+		cfg, err := sqlflow.LoadConfig(configBytes)
+		if err != nil {
+			return nil, nil, err
+		}
+		flow, err := sqlflow.New(context.Background(), *cfg, workerPools, gateFactory)
+		return flow, nil, err
 	case "gcp-pubsub":
 		cfg, err := pubsub.LoadConfig(configBytes)
 		if err != nil {
@@ -467,6 +475,7 @@ func pollBacklog(ctx context.Context, reporter pipeline.BacklogReporter, interva
 		for _, s := range stats {
 			current[queueLabels{id: s.QueueID, name: s.QueueName, pool: s.PoolName}] = struct{}{}
 			metrics.SetBrokerBacklog(s.QueueID, s.QueueName, s.PoolName, float64(s.Depth))
+			metrics.SetBrokerBacklogSourceAvailable(s.QueueID, s.QueueName, s.PoolName, s.SourceAvailable)
 			// Nil counts mean the broker cannot report per-item deadlines
 			// (e.g. Cloud Pub/Sub); emit nothing for it. When present they are
 			// exact cumulative bucket counts, zeroed on a failed read so the
