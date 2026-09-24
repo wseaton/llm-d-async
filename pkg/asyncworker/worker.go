@@ -332,7 +332,7 @@ func WorkerWithGateTimeout(consumeCtx, requestCtx context.Context, characteristi
 					logger.V(logutil.DEBUG).Info("Sending inference request", "url", msg.RequestURL)
 					metrics.RecordDispatchedReq(queueID, queueName, msg.WorkerPoolID)
 					inferenceStart := time.Now()
-					resp, err := client.SendRequest(reqCtx, msg.RequestURL, sendHeaders, sendPayload)
+					resp, stored, err := sendStoring(reqCtx, client, resultStoreFromContext(requestCtx), msg, msg.RequestURL, sendHeaders, sendPayload)
 					metrics.RecordInferenceLatency(float64(time.Since(inferenceStart).Milliseconds()), queueID, queueName, msg.WorkerPoolID)
 
 					if err == nil {
@@ -346,15 +346,8 @@ func WorkerWithGateTimeout(consumeCtx, requestCtx context.Context, characteristi
 							}
 						}
 						result := asyncapi.NewHTTPResult(msg.PublicRequest, msg.InternalRouting, resp.StatusCode, resp.Body)
-						if store := resultStoreFromContext(requestCtx); store != nil && resp.StatusCode >= 200 && resp.StatusCode < 300 && !returnedInline(resp.ContentType) {
-							stored, serr := storeResult(reqCtx, store, msg, resp)
-							if serr != nil {
-								span.RecordError(serr)
-								logger.V(logutil.DEFAULT).Error(serr, "Retrying request whose response body could not be stored", "id", msg.PublicRequest.ReqID())
-								retryMessage(requestCtx, msg, retryChannel, resultChannel, 0, *resp)
-								return
-							}
-							result = stored
+						if stored != nil {
+							result = *stored
 						}
 						select {
 						case resultChannel <- result:

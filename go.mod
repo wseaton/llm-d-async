@@ -8,6 +8,7 @@ require (
 	github.com/alicebob/miniredis/v2 v2.39.0
 	github.com/aws/aws-sdk-go-v2 v1.47.0
 	github.com/aws/aws-sdk-go-v2/config v1.33.4
+	github.com/aws/aws-sdk-go-v2/feature/s3/manager v1.23.5
 	github.com/aws/aws-sdk-go-v2/service/s3 v1.113.0
 	github.com/go-logr/logr v1.4.4
 	github.com/llm-d/llm-d-async/api v0.10.0

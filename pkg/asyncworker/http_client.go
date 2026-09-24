@@ -24,8 +24,16 @@ func NewHTTPInferenceClient(client *http.Client) *HTTPInferenceClient {
 	return &HTTPInferenceClient{client: client}
 }
 
+// responseSink takes a successful response body before the client reads it. It reports whether
+// it consumed the body; when it did not, the client reads the body as usual.
+type responseSink func(statusCode int, contentType string, body io.Reader) (consumed bool, err error)
+
 // SendRequest implements InferenceClient for HTTP-based inference requests.
 func (h *HTTPInferenceClient) SendRequest(ctx context.Context, url string, headers map[string]string, payload []byte) (*asyncapi.InferenceResponse, error) {
+	return h.sendRequest(ctx, url, headers, payload, nil)
+}
+
+func (h *HTTPInferenceClient) sendRequest(ctx context.Context, url string, headers map[string]string, payload []byte, sink responseSink) (*asyncapi.InferenceResponse, error) {
 	request, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewBuffer(payload))
 	if err != nil {
 		return nil, &asyncapi.ClientError{
@@ -55,6 +63,20 @@ func (h *HTTPInferenceClient) SendRequest(ctx context.Context, url string, heade
 	retryAfter, _ := parseRetryAfter(result.Header.Get("Retry-After"))
 
 	contentType := result.Header.Get("Content-Type")
+	if sink != nil && result.StatusCode >= 200 && result.StatusCode < 300 {
+		consumed, serr := sink(result.StatusCode, contentType, result.Body)
+		if serr != nil {
+			return &asyncapi.InferenceResponse{StatusCode: result.StatusCode, ContentType: contentType}, &asyncapi.ClientError{
+				ErrorCategory: asyncapi.ErrCategoryServer,
+				Message:       "failed to store response body",
+				RawError:      serr,
+				StatusCode:    result.StatusCode,
+			}
+		}
+		if consumed {
+			return &asyncapi.InferenceResponse{StatusCode: result.StatusCode, ContentType: contentType}, nil
+		}
+	}
 	body, err := io.ReadAll(result.Body)
 	if err != nil {
 		return &asyncapi.InferenceResponse{StatusCode: result.StatusCode, ContentType: contentType, Body: body}, &asyncapi.ClientError{
