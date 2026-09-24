@@ -55,6 +55,16 @@ ap:
   drainTimeout: "2m"
   prometheusURL: ""
   prometheusCacheTTL: ""
+  # Store non-JSON response bodies (audio, images) in an S3-compatible bucket; the result then
+  # carries payload_ref instead of the body. Empty bucket keeps every body inline. Credentials
+  # come from AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY, e.g. via ap.env secretKeyRef entries.
+  resultStore:
+    s3:
+      bucket: ""
+      endpoint: ""
+      region: ""
+      prefix: ""
+      pathStyle: false
   # Extra environment variables to inject into the processor container.
   # Useful for passing backend-specific configuration like PUBSUB_EMULATOR_HOST.
   # Note: Avoid setting NAMESPACE or POD_NAME here as it will override the downward

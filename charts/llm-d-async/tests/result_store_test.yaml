@@ -1,0 +1,57 @@
+suite: result store
+templates:
+  - templates/ap-deployments.yaml
+set:
+  ap.transport: redis-pubsub
+  ap.transportConfig:
+    queues:
+      - queue_name: request-queue
+        igw_base_url: "http://igw:80"
+  ap.redis.secretName: "redis-creds"
+tests:
+  - it: renders no result store flags by default
+    asserts:
+      - notContains:
+          path: spec.template.spec.containers[0].args
+          content: --result-store-s3-path-style=true
+      - notMatchRegex:
+          path: spec.template.spec.containers[0].args[1]
+          pattern: result-store
+
+  - it: renders every result store flag when a bucket is set
+    set:
+      ap.resultStore.s3:
+        bucket: audio-results
+        endpoint: http://seaweedfs-s3:8333
+        region: us-east-1
+        prefix: llm-d-async/results
+        pathStyle: true
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].args
+          content: --result-store-s3-bucket=audio-results
+      - contains:
+          path: spec.template.spec.containers[0].args
+          content: --result-store-s3-endpoint=http://seaweedfs-s3:8333
+      - contains:
+          path: spec.template.spec.containers[0].args
+          content: --result-store-s3-region=us-east-1
+      - contains:
+          path: spec.template.spec.containers[0].args
+          content: --result-store-s3-prefix=llm-d-async/results
+      - contains:
+          path: spec.template.spec.containers[0].args
+          content: --result-store-s3-path-style=true
+
+  - it: ignores the other settings without a bucket
+    set:
+      ap.resultStore.s3:
+        endpoint: http://seaweedfs-s3:8333
+        pathStyle: true
+    asserts:
+      - notContains:
+          path: spec.template.spec.containers[0].args
+          content: --result-store-s3-endpoint=http://seaweedfs-s3:8333
+      - notContains:
+          path: spec.template.spec.containers[0].args
+          content: --result-store-s3-path-style=true
