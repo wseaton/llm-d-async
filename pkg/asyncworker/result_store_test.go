@@ -201,3 +201,72 @@ func TestWorkerWithoutAStoreKeepsTheBodyInline(t *testing.T) {
 		t.Fatal("timeout waiting for the result")
 	}
 }
+
+type readFunc func(p []byte) (int, error)
+
+func (f readFunc) Read(p []byte) (int, error) { return f(p) }
+
+// observedStore wraps a real store and closes started the first time the upload reads the body.
+type observedStore struct {
+	inner   ResultStore
+	started chan struct{}
+	once    sync.Once
+}
+
+func (s *observedStore) Put(ctx context.Context, key, contentType string, body io.Reader) (string, error) {
+	return s.inner.Put(ctx, key, contentType, readFunc(func(p []byte) (int, error) {
+		s.once.Do(func() { close(s.started) })
+		return body.Read(p)
+	}))
+}
+
+func TestWorkerStreamsTheBodyIntoTheStoreAsItArrives(t *testing.T) {
+	store, client, bucket := s3Fixture(t)
+	observed := &observedStore{inner: store, started: make(chan struct{})}
+
+	chunk := bytes.Repeat([]byte{0x52, 0x49, 0x46, 0x46, 0x10, 0x00}, 1<<17)
+	const chunks = 12
+	sum := sha256.New()
+	pr, pw := io.Pipe()
+	go func() {
+		for i := range chunks {
+			if i == 1 {
+				select {
+				case <-observed.started:
+				case <-time.After(5 * time.Second):
+					_ = pw.CloseWithError(fmt.Errorf("the body was not streamed: the upload never started while the response was still arriving"))
+					return
+				}
+			}
+			_, _ = sum.Write(chunk)
+			if _, err := pw.Write(chunk); err != nil {
+				return
+			}
+		}
+		_ = pw.Close()
+	}()
+	httpClient := NewTestClient(func(*http.Request) (*http.Response, error) {
+		h := make(http.Header)
+		h.Set("Content-Type", "audio/wav")
+		return &http.Response{StatusCode: http.StatusOK, Header: h, Body: pr}, nil
+	})
+
+	results, retries := runOne(t, observed, httpClient, speechRequest("stream-1", "gen-a"))
+	select {
+	case r := <-results:
+		assert.Empty(t, r.Payload)
+		assert.EqualValues(t, chunks*len(chunk), r.PayloadSize)
+		assert.Equal(t, hex.EncodeToString(sum.Sum(nil)), r.PayloadSHA256)
+		out, err := client.GetObject(context.Background(), &awss3.GetObjectInput{Bucket: aws.String(bucket), Key: aws.String(t.Name() + "/stream-1/gen-a")})
+		require.NoError(t, err)
+		defer func() { _ = out.Body.Close() }()
+		stored, err := io.ReadAll(out.Body)
+		require.NoError(t, err)
+		got := sha256.Sum256(stored)
+		assert.Equal(t, r.PayloadSHA256, hex.EncodeToString(got[:]))
+	case r := <-retries:
+		t.Fatalf("streamed response was retried: %+v", r)
+	case <-time.After(20 * time.Second):
+		t.Fatal("timeout waiting for the result")
+	}
+}

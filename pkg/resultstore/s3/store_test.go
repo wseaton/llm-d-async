@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"path"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -66,7 +67,7 @@ func TestPutStoresTheBodyUnderThePrefix(t *testing.T) {
 	s := newTestStore(t, "llm-d-async/results")
 	body := bytes.Repeat([]byte{0xff, 0xfb, 0x90, 0x00, 0x80}, 50_000)
 
-	ref, err := s.Put(context.Background(), "req-1/tok-a", "audio/mpeg", body)
+	ref, err := s.Put(context.Background(), "req-1/tok-a", "audio/mpeg", bytes.NewReader(body))
 	require.NoError(t, err)
 
 	assert.Equal(t, "s3://"+s.bucket+"/"+s.prefix+"/req-1/tok-a", ref)
@@ -80,7 +81,7 @@ func TestPutWithoutAPrefix(t *testing.T) {
 	s := newTestStore(t, "")
 	s.prefix = ""
 	key := t.Name() + "-req-2"
-	ref, err := s.Put(context.Background(), key, "audio/wav", []byte("RIFF"))
+	ref, err := s.Put(context.Background(), key, "audio/wav", strings.NewReader("RIFF"))
 	require.NoError(t, err)
 	assert.Equal(t, "s3://"+s.bucket+"/"+key, ref)
 	got, _ := s.getObject(t, key)
@@ -90,7 +91,7 @@ func TestPutWithoutAPrefix(t *testing.T) {
 func TestPutFailsOnAMissingBucket(t *testing.T) {
 	s := newTestStore(t, "")
 	s.bucket = "no-such-bucket-" + fmt.Sprint(time.Now().UnixNano())
-	_, err := s.Put(context.Background(), "req-3", "audio/wav", []byte("RIFF"))
+	_, err := s.Put(context.Background(), "req-3", "audio/wav", strings.NewReader("RIFF"))
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "s3://"+s.bucket+"/"+s.prefix+"/req-3")
 }
@@ -98,4 +99,27 @@ func TestPutFailsOnAMissingBucket(t *testing.T) {
 func TestNewRequiresABucket(t *testing.T) {
 	_, err := New(context.Background(), Config{Endpoint: "http://127.0.0.1:1"})
 	assert.Error(t, err)
+}
+
+// onlyReader hides everything but Read, so the uploader cannot seek or size the body and has
+// to stream it.
+type onlyReader struct{ r io.Reader }
+
+func (o onlyReader) Read(p []byte) (int, error) { return o.r.Read(p) }
+
+func TestPutStreamsABodyLongerThanOnePart(t *testing.T) {
+	s := newTestStore(t, "multipart")
+	body := make([]byte, 2*partSize+partSize/3)
+	for i := range body {
+		body[i] = byte(i * 31)
+	}
+
+	ref, err := s.Put(context.Background(), "long/tok", "audio/wav", onlyReader{bytes.NewReader(body)})
+	require.NoError(t, err)
+
+	assert.Equal(t, "s3://"+s.bucket+"/"+s.prefix+"/long/tok", ref)
+	got, contentType := s.getObject(t, s.prefix+"/long/tok")
+	assert.Equal(t, len(body), len(got))
+	assert.True(t, bytes.Equal(body, got), "multipart body must survive byte for byte")
+	assert.Equal(t, "audio/wav", contentType)
 }
