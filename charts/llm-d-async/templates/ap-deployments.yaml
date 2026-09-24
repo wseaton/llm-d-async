@@ -73,6 +73,23 @@ spec:
           {{- if .Values.ap.prometheusCacheTTL }}
           - --prometheus-cache-ttl={{ .Values.ap.prometheusCacheTTL }}
           {{- end }}
+          {{- with .Values.ap.resultStore.s3 }}
+          {{- if .bucket }}
+          - --result-store-s3-bucket={{ .bucket }}
+          {{- with .endpoint }}
+          - --result-store-s3-endpoint={{ . }}
+          {{- end }}
+          {{- with .region }}
+          - --result-store-s3-region={{ . }}
+          {{- end }}
+          {{- with .prefix }}
+          - --result-store-s3-prefix={{ . }}
+          {{- end }}
+          {{- if .pathStyle }}
+          - --result-store-s3-path-style=true
+          {{- end }}
+          {{- end }}
+          {{- end }}
           {{- if .Values.ap.workerPools }}
           - --pool-config-file=/etc/llm-d-async/config/worker-pools.json
           {{- end }}
