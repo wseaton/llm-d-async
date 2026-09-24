@@ -23,6 +23,7 @@ import (
 	"github.com/llm-d/llm-d-async/pkg/plugins"
 	"github.com/llm-d/llm-d-async/pkg/pubsub"
 	"github.com/llm-d/llm-d-async/pkg/redis"
+	s3store "github.com/llm-d/llm-d-async/pkg/resultstore/s3"
 	"github.com/llm-d/llm-d-async/pkg/sqlflow"
 	"github.com/llm-d/llm-d-async/pkg/version"
 	"github.com/spf13/pflag"
@@ -32,6 +33,8 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/metrics/filters"
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 )
+
+var _ asyncworker.ResultStore = (*s3store.Store)(nil)
 
 type Runner struct {
 	opts *Options
@@ -138,6 +141,14 @@ func (r *Runner) Run(ctx context.Context) (err error) {
 	defer drainCancel()
 	if provider, ok := flow.(pipeline.CancellationCheckerProvider); ok {
 		drainCtx = asyncworker.WithCancellationChecker(drainCtx, provider.CancellationChecker())
+	}
+	if rs := opts.ResultStore; rs.S3Bucket != "" {
+		store, err := s3store.New(ctx, s3store.Config{Endpoint: rs.S3Endpoint, Region: rs.S3Region, Bucket: rs.S3Bucket, Prefix: rs.S3Prefix, PathStyle: rs.S3PathStyle})
+		if err != nil {
+			return err
+		}
+		drainCtx = asyncworker.WithResultStore(drainCtx, store)
+		setupLog.Info("Non-JSON response bodies are stored by reference", "bucket", rs.S3Bucket, "prefix", rs.S3Prefix, "endpoint", rs.S3Endpoint)
 	}
 
 	dispatch := policy.MergeRequestChannels(flow.RequestChannels(), poolsMap)

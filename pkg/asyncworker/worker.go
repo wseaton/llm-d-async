@@ -351,8 +351,19 @@ func WorkerWithGateTimeout(consumeCtx, requestCtx context.Context, characteristi
 								metrics.RecordTokens(input, output, queueID, queueName, msg.WorkerPoolID)
 							}
 						}
+						result := asyncapi.NewHTTPResult(msg.PublicRequest, msg.InternalRouting, resp.StatusCode, resp.Body)
+						if store := resultStoreFromContext(requestCtx); store != nil && resp.StatusCode >= 200 && resp.StatusCode < 300 && !returnedInline(resp.ContentType) {
+							stored, serr := storeResult(reqCtx, store, msg, resp)
+							if serr != nil {
+								span.RecordError(serr)
+								logger.V(logutil.DEFAULT).Error(serr, "Retrying request whose response body could not be stored", "id", msg.PublicRequest.ReqID())
+								retryMessage(requestCtx, msg, retryChannel, resultChannel, 0, *resp)
+								return
+							}
+							result = stored
+						}
 						select {
-						case resultChannel <- asyncapi.NewHTTPResult(msg.PublicRequest, msg.InternalRouting, resp.StatusCode, resp.Body):
+						case resultChannel <- result:
 						case <-requestCtx.Done():
 						}
 						return

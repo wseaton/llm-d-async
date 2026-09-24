@@ -58,9 +58,10 @@ func (h *HTTPInferenceClient) SendRequest(ctx context.Context, url string, heade
 	droppedReason := result.Header.Get(asyncapi.DroppedReasonHeader)
 	retryAfter, _ := parseRetryAfter(result.Header.Get("Retry-After"))
 
+	contentType := result.Header.Get("Content-Type")
 	body, err := io.ReadAll(result.Body)
 	if err != nil {
-		return &asyncapi.InferenceResponse{StatusCode: result.StatusCode, Body: body}, &asyncapi.ClientError{
+		return &asyncapi.InferenceResponse{StatusCode: result.StatusCode, ContentType: contentType, Body: body}, &asyncapi.ClientError{
 			ErrorCategory: asyncapi.ErrCategoryServer,
 			Message:       "failed to read response",
 			RawError:      err,
@@ -70,7 +71,7 @@ func (h *HTTPInferenceClient) SendRequest(ctx context.Context, url string, heade
 		}
 	}
 
-	resp := &asyncapi.InferenceResponse{StatusCode: result.StatusCode, Body: body}
+	resp := &asyncapi.InferenceResponse{StatusCode: result.StatusCode, ContentType: contentType, Body: body}
 
 	if result.StatusCode == 429 {
 		return resp, &asyncapi.ClientError{

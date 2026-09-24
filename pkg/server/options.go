@@ -56,6 +56,16 @@ type PrometheusConfig struct {
 	CacheTTL time.Duration
 }
 
+// ResultStoreConfig enables storing non-JSON response bodies in an S3-compatible bucket; the
+// result message then carries a reference instead of the body. Empty Bucket disables it.
+type ResultStoreConfig struct {
+	S3Endpoint  string
+	S3Region    string
+	S3Bucket    string
+	S3Prefix    string
+	S3PathStyle bool
+}
+
 type Config struct {
 	Server              ServerConfig
 	TLS                 TLSConfig
@@ -63,6 +73,7 @@ type Config struct {
 	Transport           TransportOptions
 	Observability       ObservabilityConfig
 	Prometheus          PrometheusConfig
+	ResultStore         ResultStoreConfig
 	TransformConfigFile string
 
 	// MessageQueueImpl backs the deprecated --message-queue-impl flag. Prefer
@@ -159,6 +170,12 @@ func (o *Options) AddFlags(fs *pflag.FlagSet) {
 	fs.BoolVar(&o.TLS.InsecureSkipVerify, "tls-insecure-skip-verify", o.TLS.InsecureSkipVerify, "Skip TLS certificate verification (dev/test only)")
 
 	fs.StringVar(&o.TransformConfigFile, "transform-config-file", o.TransformConfigFile, "Path to the body-transform plugins configuration JSON file (object with a requestTransforms array; empty disables transforms)")
+
+	fs.StringVar(&o.ResultStore.S3Bucket, "result-store-s3-bucket", o.ResultStore.S3Bucket, "S3 bucket for response bodies returned by reference (non-JSON responses such as audio). Empty keeps every body inline")
+	fs.StringVar(&o.ResultStore.S3Endpoint, "result-store-s3-endpoint", o.ResultStore.S3Endpoint, "S3 endpoint URL for the result store (empty uses AWS)")
+	fs.StringVar(&o.ResultStore.S3Region, "result-store-s3-region", o.ResultStore.S3Region, "S3 region for the result store (default us-east-1)")
+	fs.StringVar(&o.ResultStore.S3Prefix, "result-store-s3-prefix", o.ResultStore.S3Prefix, "Key prefix for stored response bodies")
+	fs.BoolVar(&o.ResultStore.S3PathStyle, "result-store-s3-path-style", o.ResultStore.S3PathStyle, "Use path-style S3 addressing (most S3-compatible stores)")
 
 	fs.StringVar(&o.Prometheus.URL, "prometheus-url", o.Prometheus.URL, "Prometheus server URL for metric-based gates (e.g., http://localhost:9090)")
 	fs.DurationVar(&o.Prometheus.CacheTTL, "prometheus-cache-ttl", o.Prometheus.CacheTTL, "TTL for cached Prometheus metrics (e.g., 5s, 0s to disable)")
