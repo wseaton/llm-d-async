@@ -12,11 +12,13 @@ import (
 	"math/big"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/llm-d/llm-d-async/pipeline"
+	"github.com/llm-d/llm-d-async/pkg/asyncworker"
 	"github.com/llm-d/llm-d-async/pkg/metrics"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/testutil"
@@ -322,6 +324,7 @@ func TestPollBacklogSkipsNilDeadlineViews(t *testing.T) {
 
 func TestPollBacklogRemovesDeletedQueueSnapshots(t *testing.T) {
 	metrics.BrokerBacklog.Reset()
+	metrics.BrokerBacklogSourceAvailable.Reset()
 	metrics.DispatchBudget.Reset()
 	metrics.DeadlineProximity.Reset()
 	labels := pipeline.QueueBacklogStat{QueueID: "gone", QueueName: "queue-gone", PoolName: "pool-a", Depth: 3,
@@ -341,6 +344,9 @@ func TestPollBacklogRemovesDeletedQueueSnapshots(t *testing.T) {
 
 	if got := testutil.CollectAndCount(metrics.BrokerBacklog); got != 0 {
 		t.Fatalf("deleted queue backlog still exposes %d series", got)
+	}
+	if got := testutil.CollectAndCount(metrics.BrokerBacklogSourceAvailable); got != 0 {
+		t.Fatalf("deleted queue backlog availability still exposes %d series", got)
 	}
 	if got := testutil.CollectAndCount(metrics.DeadlineProximity); got != 0 {
 		t.Fatalf("deleted queue deadline snapshot still exposes %d series", got)
@@ -371,4 +377,16 @@ func histogramFor(t *testing.T, c prometheus.Collector, wantLabels map[string]st
 	}
 	t.Fatalf("no histogram matched labels %v", wantLabels)
 	return nil
+}
+
+func TestGateWaitTimeoutOption(t *testing.T) {
+	opts := NewOptions()
+	if opts.Worker.GateWaitTimeout != asyncworker.DefaultGateWaitTimeout {
+		t.Fatalf("default gate wait timeout = %v, want %v", opts.Worker.GateWaitTimeout, asyncworker.DefaultGateWaitTimeout)
+	}
+	opts.RedisConnection.URL = "redis://localhost:6379"
+	opts.Worker.GateWaitTimeout = -time.Second
+	if err := opts.Validate(); err == nil || !strings.Contains(err.Error(), "--gate-wait-timeout must be non-negative") {
+		t.Fatalf("Validate() error = %v, want negative gate-wait-timeout error", err)
+	}
 }

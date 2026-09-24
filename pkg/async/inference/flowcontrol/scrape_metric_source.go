@@ -20,6 +20,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"time"
 
@@ -38,17 +39,20 @@ var _ MetricSource = (*ScrapeMetricSource)(nil)
 //   - Dynamic: when podsURL/podsMetric are set, ready pods are scraped from a second
 //     endpoint (e.g., EPP) and max_count = ready_pods * maxCountPerPod.
 //
-// When maxCountPerPod == 0, the metric value is assumed to already be saturation in [0, 1].
-// Output value = 1 - saturation (available capacity / budget).
+// When maxCountPerPod == 0, the metric value is assumed to already be normalized in [0, 1].
+// By default the normalized value is saturation and output = 1 - saturation. When
+// directBudget is set, the normalized value is returned as the budget instead.
 type ScrapeMetricSource struct {
 	client         *http.Client
 	url            string
 	metricName     string
 	labels         map[string]string
 	maxCountPerPod float64
+	directBudget   bool
 	podsURL        string
 	podsMetric     string
 	podsLabels     map[string]string
+	absentValue    *float64
 }
 
 // ScrapeConfig holds configuration for NewScrapeMetricSource.
@@ -57,9 +61,14 @@ type ScrapeConfig struct {
 	MetricName     string
 	Labels         map[string]string
 	MaxCountPerPod float64
+	DirectBudget   bool
 	PodsURL        string
 	PodsMetric     string
 	PodsLabels     map[string]string
+	// AbsentValue, when set, is the raw metric value assumed when a scrape succeeds but no
+	// series matches, for gauges that exist only while there is something to count. Nil
+	// leaves the source with no samples, which the gate treats as an error.
+	AbsentValue *float64
 }
 
 // NewScrapeMetricSource creates a MetricSource that scrapes Prometheus
@@ -71,47 +80,80 @@ func NewScrapeMetricSource(cfg ScrapeConfig) *ScrapeMetricSource {
 		metricName:     cfg.MetricName,
 		labels:         cfg.Labels,
 		maxCountPerPod: cfg.MaxCountPerPod,
+		directBudget:   cfg.DirectBudget,
 		podsURL:        cfg.PodsURL,
 		podsMetric:     cfg.PodsMetric,
 		podsLabels:     cfg.PodsLabels,
+		absentValue:    cfg.AbsentValue,
 	}
 }
 
 func (s *ScrapeMetricSource) Query(ctx context.Context) ([]Sample, error) {
-	samples, err := scrapeMetric(ctx, s.client, s.url, s.metricName, s.labels)
+	samples, maxCount, err := s.read(ctx)
 	if err != nil {
 		return nil, err
+	}
+	result := make([]Sample, len(samples))
+	for i, sample := range samples {
+		var normalized float64
+		if maxCount > 0 {
+			normalized = sample.Value / maxCount
+		} else {
+			normalized = sample.Value
+		}
+		normalized = clampFloat(normalized, 0, 1)
+		budget := 1 - normalized
+		if s.directBudget {
+			budget = normalized
+		}
+		result[i] = Sample{Labels: sample.Labels, Value: budget}
+	}
+	return result, nil
+}
+
+// Headroom returns the metric's free capacity in its own units, maxCount minus the first
+// matching value, floored at 0. It needs a count metric: max_count_per_pod set, saturation
+// value type.
+func (s *ScrapeMetricSource) Headroom(ctx context.Context) (float64, error) {
+	if s.maxCountPerPod <= 0 || s.directBudget {
+		return 0, fmt.Errorf("scrape: headroom needs max_count_per_pod and value_type saturation")
+	}
+	samples, maxCount, err := s.read(ctx)
+	if err != nil {
+		return 0, err
+	}
+	if len(samples) == 0 {
+		return 0, fmt.Errorf("scrape: metric %s not found at %s", s.metricName, s.url)
+	}
+	return math.Max(0, maxCount-samples[0].Value), nil
+}
+
+// read scrapes the metric and the capacity it is measured against.
+func (s *ScrapeMetricSource) read(ctx context.Context) ([]Sample, float64, error) {
+	samples, err := scrapeMetric(ctx, s.client, s.url, s.metricName, s.labels)
+	if err != nil {
+		return nil, 0, err
+	}
+	if len(samples) == 0 && s.absentValue != nil {
+		samples = []Sample{{Value: *s.absentValue}}
 	}
 
 	maxCount := s.maxCountPerPod
 	if s.podsURL != "" && s.podsMetric != "" {
 		podsSamples, err := scrapeMetric(ctx, s.client, s.podsURL, s.podsMetric, s.podsLabels)
 		if err != nil {
-			return nil, fmt.Errorf("scrape pods metric: %w", err)
+			return nil, 0, fmt.Errorf("scrape pods metric: %w", err)
 		}
 		if len(podsSamples) == 0 {
-			return nil, fmt.Errorf("scrape: pods metric %s not found at %s", s.podsMetric, s.podsURL)
+			return nil, 0, fmt.Errorf("scrape: pods metric %s not found at %s", s.podsMetric, s.podsURL)
 		}
 		pods := podsSamples[0].Value
 		if pods <= 0 {
-			return nil, fmt.Errorf("scrape: ready pods is %g, cannot compute capacity", pods)
+			return nil, 0, fmt.Errorf("scrape: ready pods is %g, cannot compute capacity", pods)
 		}
 		maxCount = pods * s.maxCountPerPod
 	}
-
-	result := make([]Sample, len(samples))
-	for i, sample := range samples {
-		var saturation float64
-		if maxCount > 0 {
-			saturation = sample.Value / maxCount
-		} else {
-			saturation = sample.Value
-		}
-		saturation = clampFloat(saturation, 0, 1)
-		result[i] = Sample{Labels: sample.Labels, Value: 1 - saturation}
-	}
-
-	return result, nil
+	return samples, maxCount, nil
 }
 
 func scrapeMetric(ctx context.Context, client *http.Client, url, metricName string, labelFilters map[string]string) ([]Sample, error) {

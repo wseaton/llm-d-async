@@ -34,6 +34,9 @@ vllm:num_requests_waiting{model_name="other-model"} 7
 # TYPE inference_pool_saturation gauge
 inference_pool_saturation{name="pool-a"} 0.75
 inference_pool_saturation{name="pool-b"} 0.2
+# HELP model_ready Whether the model is ready.
+# TYPE model_ready gauge
+model_ready{model_name="sim-model"} 1
 `
 
 const testPodsMetricsBody = `# HELP ready_pods Number of ready pods.
@@ -78,6 +81,19 @@ func TestScrapeMetricSource(t *testing.T) {
 		require.Len(t, samples, 1)
 		// value=0.75, maxCount=0 → saturation=0.75 → budget=0.25
 		assert.InDelta(t, 0.25, samples[0].Value, 0.001)
+	})
+
+	t.Run("DirectBudget", func(t *testing.T) {
+		source := NewScrapeMetricSource(ScrapeConfig{
+			URL:          server.URL,
+			MetricName:   "model_ready",
+			Labels:       map[string]string{"model_name": "sim-model"},
+			DirectBudget: true,
+		})
+		samples, err := source.Query(context.Background())
+		require.NoError(t, err)
+		require.Len(t, samples, 1)
+		assert.InDelta(t, 1.0, samples[0].Value, 0.001)
 	})
 
 	t.Run("OverSaturationClamped", func(t *testing.T) {
@@ -156,4 +172,42 @@ idle_metric 0
 		// value=0, maxCount=10 → saturation=0 → budget=1.0
 		assert.InDelta(t, 1.0, samples[0].Value, 0.001)
 	})
+}
+
+func TestScrapeMetricSourceAbsentValue(t *testing.T) {
+	server := newTestMetricsServer(testMetricsBody)
+	defer server.Close()
+	zero := 0.0
+
+	absent := NewScrapeMetricSource(ScrapeConfig{
+		URL:            server.URL,
+		MetricName:     "llm_d_epp_flow_control_queue_size",
+		Labels:         map[string]string{"priority": "-10"},
+		MaxCountPerPod: 1024,
+		AbsentValue:    &zero,
+	})
+	samples, err := absent.Query(context.Background())
+	require.NoError(t, err)
+	require.Len(t, samples, 1)
+	assert.InDelta(t, 1.0, samples[0].Value, 0.001, "an absent queue reads as empty")
+
+	unset := NewScrapeMetricSource(ScrapeConfig{
+		URL:        server.URL,
+		MetricName: "llm_d_epp_flow_control_queue_size",
+	})
+	samples, err = unset.Query(context.Background())
+	require.NoError(t, err)
+	assert.Empty(t, samples, "without absent_value a missing series stays missing")
+
+	failing := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusServiceUnavailable)
+	}))
+	defer failing.Close()
+	down := NewScrapeMetricSource(ScrapeConfig{
+		URL:         failing.URL,
+		MetricName:  "llm_d_epp_flow_control_queue_size",
+		AbsentValue: &zero,
+	})
+	_, err = down.Query(context.Background())
+	require.Error(t, err, "absent_value never covers a failed scrape")
 }

@@ -154,7 +154,7 @@ func TestSheddedRequest(t *testing.T) {
 		ID:       msgId,
 		Created:  time.Now().Unix(),
 		Deadline: deadline,
-		Payload:  map[string]any{"model": "food-review", "prompt": "hi", "max_tokens": 10, "temperature": 0},
+		Payload:  testPayload(map[string]any{"model": "food-review", "prompt": "hi", "max_tokens": 10, "temperature": 0}),
 	}, "http://localhost:30800/v1/completions", map[string]string{})
 
 	select {
@@ -191,7 +191,7 @@ func TestSuccessfulRequest(t *testing.T) {
 		ID:       msgId,
 		Created:  time.Now().Unix(),
 		Deadline: deadline,
-		Payload:  map[string]any{"model": "food-review", "prompt": "hi", "max_tokens": 10, "temperature": 0},
+		Payload:  testPayload(map[string]any{"model": "food-review", "prompt": "hi", "max_tokens": 10, "temperature": 0}),
 	}, "http://localhost:30800/v1/completions", map[string]string{})
 
 	select {
@@ -229,7 +229,7 @@ func TestSuccessfulRequest_PreservesActualStatusCode(t *testing.T) {
 		ID:       msgId,
 		Created:  time.Now().Unix(),
 		Deadline: time.Now().Add(100 * time.Second).Unix(),
-		Payload:  map[string]any{"model": "test", "prompt": "hi"},
+		Payload:  testPayload(map[string]any{"model": "test", "prompt": "hi"}),
 	}, "http://localhost:30800/v1/completions", map[string]string{})
 
 	select {
@@ -332,7 +332,7 @@ func TestWorker_CancelledRequestSkipsInference(t *testing.T) {
 		ID:       msgID,
 		Created:  time.Now().Unix(),
 		Deadline: time.Now().Add(100 * time.Second).Unix(),
-		Payload:  map[string]any{"model": "test", "prompt": "hi"},
+		Payload:  testPayload(map[string]any{"model": "test", "prompt": "hi"}),
 	}, "http://localhost:30800/v1/completions", map[string]string{})
 
 	select {
@@ -383,7 +383,7 @@ func TestWorker_CancellationCheckErrorRequeuesRequest(t *testing.T) {
 		ID:       msgID,
 		Created:  time.Now().Unix(),
 		Deadline: time.Now().Add(100 * time.Second).Unix(),
-		Payload:  map[string]any{"model": "test", "prompt": "hi"},
+		Payload:  testPayload(map[string]any{"model": "test", "prompt": "hi"}),
 	}, "http://localhost:30800/v1/completions", map[string]string{})
 
 	select {
@@ -430,7 +430,7 @@ func TestWorker_FastPathChecksCancellationOnce(t *testing.T) {
 		ID:       msgID,
 		Created:  time.Now().Unix(),
 		Deadline: time.Now().Add(100 * time.Second).Unix(),
-		Payload:  map[string]any{"model": "test", "prompt": "hi"},
+		Payload:  testPayload(map[string]any{"model": "test", "prompt": "hi"}),
 	}, "http://localhost:30800/v1/completions", map[string]string{})
 
 	select {
@@ -476,7 +476,7 @@ func TestWorker_PoolGateActionWaitThrottlesCancellationChecks(t *testing.T) {
 		ID:       "gate-wait-throttled",
 		Created:  time.Now().Unix(),
 		Deadline: time.Now().Add(30 * time.Second).Unix(),
-		Payload:  map[string]any{"model": "test", "prompt": "hi"},
+		Payload:  testPayload(map[string]any{"model": "test", "prompt": "hi"}),
 	}, "http://localhost:30800/v1/completions", nil)
 
 	select {
@@ -497,16 +497,195 @@ func TestWorker_PoolGateActionWaitThrottlesCancellationChecks(t *testing.T) {
 	if got := checker.checkCount(); got > 1 {
 		t.Fatalf("expected throttled cancellation checks during ActionWait, got %d", got)
 	}
+	if got := gate.applyCount.Load(); got > 3 {
+		t.Fatalf("expected bounded backoff to limit gate polls, got %d applies in 220ms", got)
+	}
 	if called.Load() != 0 {
 		t.Fatalf("expected inference client to be skipped, got %d calls", called.Load())
 	}
 }
 
+func TestWorker_PoolGateWaitTimeoutReenqueues(t *testing.T) {
+	var called atomic.Int32
+	inferenceClient := NewHTTPInferenceClient(NewTestClient(func(req *http.Request) (*http.Response, error) {
+		called.Add(1)
+		return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(bytes.NewReader(nil)), Header: make(http.Header)}, nil
+	}))
+	requestChannel := make(chan pipeline.EmbelishedRequestMessage, 1)
+	retryChannel := make(chan pipeline.RetryMessage, 1)
+	resultChannel := make(chan asyncapi.ResultMessage, 1)
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+
+	go WorkerWithGateTimeout(ctx, ctx, pipeline.Characteristics{}, inferenceClient, requestChannel, retryChannel, resultChannel,
+		10*time.Millisecond, 100*time.Millisecond, nil, &waitingPoolGate{})
+
+	msg := newEmb(asyncapi.RequestMessage{
+		ID:       "gate-wait-timeout",
+		Created:  time.Now().Unix(),
+		Deadline: time.Now().Add(30 * time.Second).Unix(),
+		Payload:  testPayload(map[string]any{"model": "test", "prompt": "hi"}),
+	}, "http://localhost:30800/v1/completions", nil)
+	msg.QueueID = "gate-wait-timeout-q"
+	msg.RequestQueueName = "gate-wait-timeout-queue"
+	metric := metrics.GateWaitRequeues.WithLabelValues(msg.QueueID, msg.RequestQueueName, msg.WorkerPoolID)
+	before := testutil.ToFloat64(metric)
+	requestChannel <- msg
+
+	select {
+	case retry := <-retryChannel:
+		if retry.PublicRequest.ReqID() != "gate-wait-timeout" {
+			t.Fatalf("re-enqueued wrong request %q", retry.PublicRequest.ReqID())
+		}
+	case result := <-resultChannel:
+		t.Fatalf("gate wait timeout must be recoverable, got terminal result %+v", result)
+	case <-time.After(2 * time.Second):
+		t.Fatal("timeout waiting for gate-wait requeue")
+	}
+	if called.Load() != 0 {
+		t.Fatalf("expected no inference call while gate stayed closed, got %d", called.Load())
+	}
+	if got := testutil.ToFloat64(metric); got != before+1 {
+		t.Fatalf("gate-wait requeues = %v, want %v", got, before+1)
+	}
+}
+
+func TestWorker_PoolGatePublicDeadlineDoesNotCountWaitTimeout(t *testing.T) {
+	inferenceClient := NewHTTPInferenceClient(NewTestClient(func(req *http.Request) (*http.Response, error) {
+		t.Fatal("inference must not be called while the gate stays closed")
+		return nil, nil
+	}))
+	requestChannel := make(chan pipeline.EmbelishedRequestMessage, 1)
+	retryChannel := make(chan pipeline.RetryMessage, 1)
+	resultChannel := make(chan asyncapi.ResultMessage, 1)
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+
+	go WorkerWithGateTimeout(ctx, ctx, pipeline.Characteristics{}, inferenceClient, requestChannel, retryChannel, resultChannel,
+		10*time.Millisecond, 10*time.Second, nil, &waitingPoolGate{})
+
+	msg := newEmb(asyncapi.RequestMessage{
+		ID:       "gate-wait-public-deadline",
+		Created:  time.Now().Unix(),
+		Deadline: time.Now().Unix() + 1,
+		Payload:  testPayload(map[string]any{"model": "test", "prompt": "hi"}),
+	}, "http://localhost:30800/v1/completions", nil)
+	msg.QueueID = "gate-wait-public-deadline-q"
+	msg.RequestQueueName = "gate-wait-public-deadline-queue"
+	metric := metrics.GateWaitRequeues.WithLabelValues(msg.QueueID, msg.RequestQueueName, msg.WorkerPoolID)
+	before := testutil.ToFloat64(metric)
+	requestChannel <- msg
+
+	select {
+	case retry := <-retryChannel:
+		t.Fatalf("public deadline must be terminal, got retry for %q", retry.PublicRequest.ReqID())
+	case result := <-resultChannel:
+		if result.ErrorCode != asyncapi.ErrCodeDeadlineExceeded {
+			t.Fatalf("error code = %q, want %q", result.ErrorCode, asyncapi.ErrCodeDeadlineExceeded)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("timeout waiting for public deadline result")
+	}
+	if got := testutil.ToFloat64(metric); got != before {
+		t.Fatalf("gate-wait requeues = %v, want unchanged %v", got, before)
+	}
+}
+
+func TestWorker_PoolGateWaitDoesNotConsumeInferenceTimeout(t *testing.T) {
+	var called atomic.Int32
+	inferenceClient := NewHTTPInferenceClient(NewTestClient(func(req *http.Request) (*http.Response, error) {
+		called.Add(1)
+		return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(bytes.NewReader(nil)), Header: make(http.Header)}, nil
+	}))
+	requestChannel := make(chan pipeline.EmbelishedRequestMessage, 1)
+	retryChannel := make(chan pipeline.RetryMessage, 1)
+	resultChannel := make(chan asyncapi.ResultMessage, 1)
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+
+	gate := &waitThenContinueGate{waits: 2}
+	go WorkerWithGateTimeout(ctx, ctx, pipeline.Characteristics{}, inferenceClient, requestChannel, retryChannel, resultChannel,
+		10*time.Millisecond, time.Second, nil, gate)
+
+	requestChannel <- newEmb(asyncapi.RequestMessage{
+		ID:       "gate-wait-independent-timeout",
+		Created:  time.Now().Unix(),
+		Deadline: time.Now().Add(30 * time.Second).Unix(),
+		Payload:  testPayload(map[string]any{"model": "test", "prompt": "hi"}),
+	}, "http://localhost:30800/v1/completions", nil)
+
+	select {
+	case <-retryChannel:
+		t.Fatal("request should dispatch after the gate opens")
+	case result := <-resultChannel:
+		if result.ErrorCode != "" {
+			t.Fatalf("expected successful result after gate opened, got %+v", result)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timeout waiting for inference result")
+	}
+	if called.Load() != 1 {
+		t.Fatalf("expected one inference call, got %d", called.Load())
+	}
+}
+
+func TestGateWaitBackoffIsBoundedAndJittered(t *testing.T) {
+	backoff := gateWaitInitialBackoff
+	for i := 0; i < 10; i++ {
+		delay := jitteredGateWait(backoff)
+		if delay < backoff/2 || delay > backoff {
+			t.Fatalf("jittered wait %v outside [%v, %v]", delay, backoff/2, backoff)
+		}
+		backoff = nextGateWaitBackoff(backoff)
+	}
+	if backoff != gateWaitMaxBackoff {
+		t.Fatalf("backoff = %v, want cap %v", backoff, gateWaitMaxBackoff)
+	}
+}
+
+func TestTransportError_Retries(t *testing.T) {
+	httpclient := NewTestClient(func(req *http.Request) (*http.Response, error) {
+		return nil, fmt.Errorf("dial tcp 10.0.0.1:80: connect: connection refused")
+	})
+	inferenceClient := NewHTTPInferenceClient(httpclient)
+	requestChannel := make(chan pipeline.EmbelishedRequestMessage, 1)
+	retryChannel := make(chan pipeline.RetryMessage, 1)
+	resultChannel := make(chan asyncapi.ResultMessage, 1)
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+
+	go Worker(ctx, ctx, pipeline.Characteristics{HasExternalBackoff: false}, inferenceClient, requestChannel, retryChannel, resultChannel, defaultRequestTimeout, nil)
+
+	requestChannel <- newEmb(asyncapi.RequestMessage{
+		ID:       "transport",
+		Created:  time.Now().Unix(),
+		Deadline: time.Now().Add(100 * time.Second).Unix(),
+		Payload:  testPayload(map[string]any{"model": "food-review", "prompt": "hi", "max_tokens": 10, "temperature": 0}),
+	}, "http://localhost:30800/v1/completions", map[string]string{})
+
+	select {
+	case r := <-retryChannel:
+		if r.PublicRequest.ReqID() != "transport" {
+			t.Errorf("retried message id = %q, want transport", r.PublicRequest.ReqID())
+		}
+		if r.BackoffDurationSeconds <= 0 {
+			t.Errorf("retry backoff = %v, want > 0", r.BackoffDurationSeconds)
+		}
+	case r := <-resultChannel:
+		t.Errorf("transport error produced a final result instead of a retry: %+v", r)
+	case <-time.After(time.Second):
+		t.Errorf("timeout waiting for the retry")
+	}
+}
+
 func TestFatalError_NoRetry(t *testing.T) {
 	msgId := "456"
-	// Simulate a transport error (fatal)
 	httpclient := NewTestClient(func(req *http.Request) (*http.Response, error) {
-		return nil, fmt.Errorf("network unreachable")
+		return &http.Response{
+			StatusCode: http.StatusBadRequest,
+			Body:       io.NopCloser(bytes.NewBufferString(`{"error": "invalid request"}`)),
+			Header:     make(http.Header),
+		}, nil
 	})
 	inferenceClient := NewHTTPInferenceClient(httpclient)
 	requestChannel := make(chan pipeline.EmbelishedRequestMessage, 1)
@@ -516,13 +695,11 @@ func TestFatalError_NoRetry(t *testing.T) {
 
 	go Worker(ctx, ctx, pipeline.Characteristics{HasExternalBackoff: false}, inferenceClient, requestChannel, retryChannel, resultChannel, defaultRequestTimeout, nil)
 
-	deadline := time.Now().Add(time.Second * 100).Unix()
-
 	requestChannel <- newEmb(asyncapi.RequestMessage{
 		ID:       msgId,
 		Created:  time.Now().Unix(),
-		Deadline: deadline,
-		Payload:  map[string]any{"model": "food-review", "prompt": "hi", "max_tokens": 10, "temperature": 0},
+		Deadline: time.Now().Add(time.Second * 100).Unix(),
+		Payload:  testPayload(map[string]any{"model": "food-review", "prompt": "hi", "max_tokens": 10, "temperature": 0}),
 	}, "http://localhost:30800/v1/completions", map[string]string{})
 
 	select {
@@ -532,22 +709,8 @@ func TestFatalError_NoRetry(t *testing.T) {
 		if r.ID != msgId {
 			t.Errorf("Expected result message id to be %s, got %s", msgId, r.ID)
 		}
-		if r.StatusCode != 0 {
-			t.Errorf("Expected StatusCode 0 for non-HTTP error, got %d", r.StatusCode)
-		}
-		if r.ErrorCode != asyncapi.ErrCodeInferenceError {
-			t.Errorf("Expected ErrorCode %q, got %q", asyncapi.ErrCodeInferenceError, r.ErrorCode)
-		}
-		if r.ErrorMessage == "" {
-			t.Errorf("Expected non-empty ErrorMessage for non-HTTP error")
-		}
-		var resultMap map[string]any
-		err := json.Unmarshal([]byte(r.Payload), &resultMap)
-		if err != nil {
-			t.Errorf("Failed to unmarshal result payload: %s. Payload was: %s", err, r.Payload)
-		}
-		if _, hasError := resultMap["error"]; !hasError {
-			t.Errorf("Expected error in result payload, got: %s", r.Payload)
+		if r.StatusCode != http.StatusBadRequest {
+			t.Errorf("Expected StatusCode %d, got %d", http.StatusBadRequest, r.StatusCode)
 		}
 	case <-time.After(time.Second):
 		t.Errorf("Timeout waiting for result")
@@ -576,7 +739,7 @@ func TestRateLimitRequest(t *testing.T) {
 		ID:       msgId,
 		Created:  time.Now().Unix(),
 		Deadline: deadline,
-		Payload:  map[string]any{"model": "food-review", "prompt": "hi", "max_tokens": 10, "temperature": 0},
+		Payload:  testPayload(map[string]any{"model": "food-review", "prompt": "hi", "max_tokens": 10, "temperature": 0}),
 	}, "http://localhost:30800/v1/completions", map[string]string{})
 
 	select {
@@ -612,7 +775,7 @@ func TestRequestTimeout(t *testing.T) {
 		ID:       msgId,
 		Created:  time.Now().Unix(),
 		Deadline: deadline,
-		Payload:  map[string]any{"model": "test", "prompt": "hi"},
+		Payload:  testPayload(map[string]any{"model": "test", "prompt": "hi"}),
 	}, "http://localhost:30800/v1/completions", map[string]string{})
 
 	select {
@@ -900,7 +1063,7 @@ func TestRateLimitRequest_WithRetryAfterHeader(t *testing.T) {
 		ID:       msgId,
 		Created:  time.Now().Unix(),
 		Deadline: deadline,
-		Payload:  map[string]any{"model": "test", "prompt": "hi"},
+		Payload:  testPayload(map[string]any{"model": "test", "prompt": "hi"}),
 	}, "http://localhost:30800/v1/completions", map[string]string{})
 
 	select {
@@ -1000,7 +1163,7 @@ func TestWorker_cancelledCtxExitsPromptly(t *testing.T) {
 		ID:       "worker-cancel-test",
 		Created:  time.Now().Unix(),
 		Deadline: deadline,
-		Payload:  map[string]any{"model": "test", "prompt": "hi"},
+		Payload:  testPayload(map[string]any{"model": "test", "prompt": "hi"}),
 	}, "http://localhost:30800/v1/completions", map[string]string{})
 
 	// Give the worker a moment to pick up the message and attempt the send,
@@ -1038,7 +1201,7 @@ func TestClientError_NoRetry(t *testing.T) {
 		ID:       msgId,
 		Created:  time.Now().Unix(),
 		Deadline: deadline,
-		Payload:  map[string]any{"model": "food-review", "prompt": "hi", "max_tokens": 10, "temperature": 0},
+		Payload:  testPayload(map[string]any{"model": "food-review", "prompt": "hi", "max_tokens": 10, "temperature": 0}),
 	}, "http://localhost:30800/v1/completions", map[string]string{})
 
 	select {
@@ -1083,7 +1246,7 @@ func TestWorker_RetriesOnShutdown(t *testing.T) {
 		ID:       msgId,
 		Created:  time.Now().Unix(),
 		Deadline: time.Now().Add(5 * time.Minute).Unix(),
-		Payload:  map[string]any{"model": "test", "prompt": "hi"},
+		Payload:  testPayload(map[string]any{"model": "test", "prompt": "hi"}),
 	}, "http://localhost:30800/v1/completions", map[string]string{})
 
 	<-reqStarted
@@ -1158,7 +1321,7 @@ func TestWorker_DrainsBufferedMessagesOnShutdown(t *testing.T) {
 					ID:       ids[i],
 					Created:  time.Now().Unix(),
 					Deadline: time.Now().Add(5 * time.Minute).Unix(),
-					Payload:  map[string]any{"model": "test", "prompt": "hi"},
+					Payload:  testPayload(map[string]any{"model": "test", "prompt": "hi"}),
 				}, "http://localhost:30800/v1/completions", map[string]string{})
 			}
 
@@ -1283,7 +1446,7 @@ func TestMetrics_QueueDepthAndInflightBalance(t *testing.T) {
 				ID:       "depth-msg",
 				Created:  time.Now().Unix(),
 				Deadline: time.Now().Add(100 * time.Second).Unix(),
-				Payload:  map[string]any{"model": "test", "prompt": "hi"},
+				Payload:  testPayload(map[string]any{"model": "test", "prompt": "hi"}),
 			}, "http://localhost:30800/v1/completions", nil)
 
 			// Wait for the terminal outcome so handling has completed.
@@ -1338,7 +1501,7 @@ func TestMetrics_QueueDepthDecrementsOnDrain(t *testing.T) {
 			ID:       fmt.Sprintf("drain-depth-%d", i),
 			Created:  time.Now().Unix(),
 			Deadline: time.Now().Add(5 * time.Minute).Unix(),
-			Payload:  map[string]any{"model": "test", "prompt": "hi"},
+			Payload:  testPayload(map[string]any{"model": "test", "prompt": "hi"}),
 		}, "http://localhost:30800/v1/completions", nil)
 	}
 	consumeCancel()
@@ -1398,7 +1561,7 @@ func TestMetrics_SuccessfulRequest(t *testing.T) {
 		ID:       "m-success",
 		Created:  time.Now().Unix(),
 		Deadline: time.Now().Add(100 * time.Second).Unix(),
-		Payload:  map[string]any{"model": "test", "prompt": "hi"},
+		Payload:  testPayload(map[string]any{"model": "test", "prompt": "hi"}),
 	}, "http://localhost:30800/v1/completions", nil)
 	// Stamp ingestion time so the worker records queue residence time, mirroring
 	// what the broker producers do when a message enters the in-process buffer.
@@ -1459,7 +1622,7 @@ func TestMetrics_SuccessfulRequestRecordsTokens(t *testing.T) {
 		ID:       "m-tokens",
 		Created:  time.Now().Unix(),
 		Deadline: time.Now().Add(100 * time.Second).Unix(),
-		Payload:  map[string]any{"model": "test", "prompt": "hi"},
+		Payload:  testPayload(map[string]any{"model": "test", "prompt": "hi"}),
 	}, "http://localhost:30800/v1/completions", nil)
 
 	select {
@@ -1504,7 +1667,7 @@ func TestMetrics_PromptOnlyUsageRegistersBothDirections(t *testing.T) {
 		ID:       "m-prompt",
 		Created:  time.Now().Unix(),
 		Deadline: time.Now().Add(100 * time.Second).Unix(),
-		Payload:  map[string]any{"model": "test", "prompt": "hi"},
+		Payload:  testPayload(map[string]any{"model": "test", "prompt": "hi"}),
 	}, "http://localhost:30800/v1/completions", nil)
 
 	select {
@@ -1549,7 +1712,7 @@ func TestMetrics_NoUsageRecordsNoTokens(t *testing.T) {
 		ID:       "m-nousage",
 		Created:  time.Now().Unix(),
 		Deadline: time.Now().Add(100 * time.Second).Unix(),
-		Payload:  map[string]any{"model": "test", "prompt": "hi"},
+		Payload:  testPayload(map[string]any{"model": "test", "prompt": "hi"}),
 	}, "http://localhost:30800/v1/completions", nil)
 
 	select {
@@ -1591,7 +1754,7 @@ func TestMetrics_NonOpenAIEndpointNotTokenized(t *testing.T) {
 		ID:       "m-otherurl",
 		Created:  time.Now().Unix(),
 		Deadline: time.Now().Add(100 * time.Second).Unix(),
-		Payload:  map[string]any{"model": "test", "prompt": "hi"},
+		Payload:  testPayload(map[string]any{"model": "test", "prompt": "hi"}),
 	}, "http://localhost:30800/v1/embeddings", nil)
 
 	select {
@@ -1633,7 +1796,7 @@ func TestMetrics_RedirectNotTokenized(t *testing.T) {
 		ID:       "m-3xx",
 		Created:  time.Now().Unix(),
 		Deadline: time.Now().Add(100 * time.Second).Unix(),
-		Payload:  map[string]any{"model": "test", "prompt": "hi"},
+		Payload:  testPayload(map[string]any{"model": "test", "prompt": "hi"}),
 	}, "http://localhost:30800/v1/completions", nil)
 
 	select {
@@ -1674,7 +1837,7 @@ func TestMetrics_RateLimited(t *testing.T) {
 		ID:       "m-shedded",
 		Created:  time.Now().Unix(),
 		Deadline: time.Now().Add(100 * time.Second).Unix(),
-		Payload:  map[string]any{"model": "test", "prompt": "hi"},
+		Payload:  testPayload(map[string]any{"model": "test", "prompt": "hi"}),
 	}, "http://localhost:30800/v1/completions", nil)
 
 	select {
@@ -1696,7 +1859,11 @@ func TestMetrics_FatalError(t *testing.T) {
 	queueName := "metrics-fatal-queue"
 
 	httpclient := NewTestClient(func(req *http.Request) (*http.Response, error) {
-		return nil, fmt.Errorf("connection refused")
+		return &http.Response{
+			StatusCode: http.StatusBadRequest,
+			Body:       io.NopCloser(bytes.NewBufferString(`{"error": "invalid request"}`)),
+			Header:     make(http.Header),
+		}, nil
 	})
 	inferenceClient := NewHTTPInferenceClient(httpclient)
 	requestChannel := make(chan pipeline.EmbelishedRequestMessage, 1)
@@ -1714,7 +1881,7 @@ func TestMetrics_FatalError(t *testing.T) {
 		ID:       "m-fatal",
 		Created:  time.Now().Unix(),
 		Deadline: time.Now().Add(100 * time.Second).Unix(),
-		Payload:  map[string]any{"model": "test", "prompt": "hi"},
+		Payload:  testPayload(map[string]any{"model": "test", "prompt": "hi"}),
 	}, "http://localhost:30800/v1/completions", nil)
 
 	select {
@@ -1754,7 +1921,7 @@ func TestMetrics_DeadlineExceeded(t *testing.T) {
 		ID:       "m-deadline",
 		Created:  time.Now().Unix(),
 		Deadline: time.Now().Add(-10 * time.Second).Unix(),
-		Payload:  map[string]any{"model": "test", "prompt": "hi"},
+		Payload:  testPayload(map[string]any{"model": "test", "prompt": "hi"}),
 	}, "http://localhost:30800/v1/completions", nil)
 
 	select {
@@ -1790,7 +1957,7 @@ func TestMetrics_LabelsIsolated(t *testing.T) {
 		QueueID: queueA, RequestQueueName: queueA,
 	}, asyncapi.RequestMessage{
 		ID: "iso-a", Created: time.Now().Unix(), Deadline: deadline,
-		Payload: map[string]any{"model": "test", "prompt": "hi"},
+		Payload: testPayload(map[string]any{"model": "test", "prompt": "hi"}),
 	}, "http://localhost:30800/v1/completions", nil)
 
 	select {
@@ -1803,7 +1970,7 @@ func TestMetrics_LabelsIsolated(t *testing.T) {
 		QueueID: queueB, RequestQueueName: queueB,
 	}, asyncapi.RequestMessage{
 		ID: "iso-b", Created: time.Now().Unix(), Deadline: deadline,
-		Payload: map[string]any{"model": "test", "prompt": "hi"},
+		Payload: testPayload(map[string]any{"model": "test", "prompt": "hi"}),
 	}, "http://localhost:30800/v1/completions", nil)
 
 	select {
@@ -1907,7 +2074,7 @@ func TestWorker_SpanOnSuccess(t *testing.T) {
 
 	requestChannel <- newEmb(asyncapi.RequestMessage{
 		ID: "span-success", Created: time.Now().Unix(), Deadline: time.Now().Add(100 * time.Second).Unix(),
-		Payload:  map[string]any{"model": "test", "prompt": "hi"},
+		Payload:  testPayload(map[string]any{"model": "test", "prompt": "hi"}),
 		Metadata: map[string]string{"model": "metadata-model"},
 	}, "http://localhost:30800/v1/completions", nil)
 
@@ -1941,12 +2108,12 @@ func TestWorker_SpanOnSuccess(t *testing.T) {
 func TestWorker_SpanOmitsUnavailableModel(t *testing.T) {
 	for _, tc := range []struct {
 		name    string
-		payload map[string]any
+		payload json.RawMessage
 	}{
-		{name: "missing", payload: map[string]any{"prompt": "hi"}},
-		{name: "empty", payload: map[string]any{"model": ""}},
-		{name: "non-string", payload: map[string]any{"model": 42}},
-		{name: "null", payload: map[string]any{"model": nil}},
+		{name: "missing", payload: testPayload(map[string]any{"prompt": "hi"})},
+		{name: "empty", payload: testPayload(map[string]any{"model": ""})},
+		{name: "non-string", payload: testPayload(map[string]any{"model": 42})},
+		{name: "null", payload: testPayload(map[string]any{"model": nil})},
 		{name: "nil-payload"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -1992,7 +2159,11 @@ func TestWorker_SpanOmitsUnavailableModel(t *testing.T) {
 func TestWorker_SpanOnFatalError(t *testing.T) {
 	exporter := setupTestTracer(t)
 	httpclient := NewTestClient(func(req *http.Request) (*http.Response, error) {
-		return nil, fmt.Errorf("network unreachable")
+		return &http.Response{
+			StatusCode: http.StatusBadRequest,
+			Body:       io.NopCloser(bytes.NewBufferString(`{"error": "invalid request"}`)),
+			Header:     make(http.Header),
+		}, nil
 	})
 	inferenceClient := NewHTTPInferenceClient(httpclient)
 	requestChannel := make(chan pipeline.EmbelishedRequestMessage, 1)
@@ -2005,7 +2176,7 @@ func TestWorker_SpanOnFatalError(t *testing.T) {
 
 	requestChannel <- newEmb(asyncapi.RequestMessage{
 		ID: "span-fatal", Created: time.Now().Unix(), Deadline: time.Now().Add(100 * time.Second).Unix(),
-		Payload: map[string]any{"model": "test", "prompt": "hi"},
+		Payload: testPayload(map[string]any{"model": "test", "prompt": "hi"}),
 	}, "http://localhost:30800/v1/completions", nil)
 
 	select {
@@ -2023,8 +2194,8 @@ func TestWorker_SpanOnFatalError(t *testing.T) {
 		t.Error("expected error status on fatal error span")
 	}
 	assertSpanAttributes(t, s,
-		attribute.String("llm_d.async.error.category", "UNKNOWN"),
-		attribute.String("error.category", "UNKNOWN"),
+		attribute.String("llm_d.async.error.category", "INVALID_REQ"),
+		attribute.String("error.category", "INVALID_REQ"),
 	)
 	if len(s.Events) == 0 {
 		t.Error("expected recorded error event on span")
@@ -2047,7 +2218,7 @@ func TestWorker_SpanOnRetryableError(t *testing.T) {
 
 	requestChannel <- newEmb(asyncapi.RequestMessage{
 		ID: "span-429", Created: time.Now().Unix(), Deadline: time.Now().Add(100 * time.Second).Unix(),
-		Payload: map[string]any{"model": "test", "prompt": "hi"},
+		Payload: testPayload(map[string]any{"model": "test", "prompt": "hi"}),
 	}, "http://localhost:30800/v1/completions", nil)
 
 	select {
@@ -2086,7 +2257,7 @@ func TestWorker_SpanOnServerError(t *testing.T) {
 
 	requestChannel <- newEmb(asyncapi.RequestMessage{
 		ID: "span-500", Created: time.Now().Unix(), Deadline: time.Now().Add(100 * time.Second).Unix(),
-		Payload: map[string]any{"model": "test", "prompt": "hi"},
+		Payload: testPayload(map[string]any{"model": "test", "prompt": "hi"}),
 	}, "http://localhost:30800/v1/completions", nil)
 
 	select {
@@ -2131,7 +2302,7 @@ func TestWorker_TraceContextExtraction(t *testing.T) {
 
 	requestChannel <- newEmb(asyncapi.RequestMessage{
 		ID: "span-ctx", Created: time.Now().Unix(), Deadline: time.Now().Add(100 * time.Second).Unix(),
-		Payload:  map[string]any{"model": "test", "prompt": "hi"},
+		Payload:  testPayload(map[string]any{"model": "test", "prompt": "hi"}),
 		Metadata: metadata,
 	}, "http://localhost:30800/v1/completions", nil)
 
@@ -2174,7 +2345,7 @@ func TestWorker_SpanOnShutdownReenqueue(t *testing.T) {
 
 	requestChannel <- newEmb(asyncapi.RequestMessage{
 		ID: "span-shutdown", Created: time.Now().Unix(), Deadline: time.Now().Add(5 * time.Minute).Unix(),
-		Payload: map[string]any{"model": "test", "prompt": "hi"},
+		Payload: testPayload(map[string]any{"model": "test", "prompt": "hi"}),
 	}, "http://localhost:30800/v1/completions", nil)
 
 	<-reqStarted
@@ -2236,7 +2407,7 @@ func TestWorker_SpanIncludesQueueName(t *testing.T) {
 		asyncapi.InternalRouting{QueueID: "my-test-qid", RequestQueueName: "my-test-queue", RetryCount: 3},
 		asyncapi.RequestMessage{
 			ID: "span-queue", Created: time.Now().Unix(), Deadline: time.Now().Add(100 * time.Second).Unix(),
-			Payload: map[string]any{"model": "test", "prompt": "hi"},
+			Payload: testPayload(map[string]any{"model": "test", "prompt": "hi"}),
 		}, "http://localhost:30800/v1/completions", nil)
 
 	select {
@@ -2292,7 +2463,7 @@ func TestWorker_InFlightCompletesOnConsumeCancel(t *testing.T) {
 		ID:       msgId,
 		Created:  time.Now().Unix(),
 		Deadline: time.Now().Add(5 * time.Minute).Unix(),
-		Payload:  map[string]any{"model": "test", "prompt": "hi"},
+		Payload:  testPayload(map[string]any{"model": "test", "prompt": "hi"}),
 	}, "http://localhost:30800/v1/completions", map[string]string{})
 
 	<-reqStarted
@@ -2354,7 +2525,7 @@ func TestWorker_DrainTimeoutCancelsInFlight(t *testing.T) {
 		ID:       msgId,
 		Created:  time.Now().Unix(),
 		Deadline: time.Now().Add(5 * time.Minute).Unix(),
-		Payload:  map[string]any{"model": "test", "prompt": "hi"},
+		Payload:  testPayload(map[string]any{"model": "test", "prompt": "hi"}),
 	}, "http://localhost:30800/v1/completions", map[string]string{})
 
 	<-reqStarted
@@ -2425,7 +2596,7 @@ func TestWorker_DrainWithCancelledRequestCtx(t *testing.T) {
 			ID:       ids[i],
 			Created:  time.Now().Unix(),
 			Deadline: time.Now().Add(5 * time.Minute).Unix(),
-			Payload:  map[string]any{"model": "test", "prompt": "hi"},
+			Payload:  testPayload(map[string]any{"model": "test", "prompt": "hi"}),
 		}, "http://localhost:30800/v1/completions", map[string]string{})
 	}
 
@@ -2479,8 +2650,9 @@ func (g *waitingPoolGate) Apply(ctx context.Context, _ *asyncapi.InternalRequest
 }
 
 type notifyingWaitGate struct {
-	applied  chan struct{}
-	notified atomic.Bool
+	applied    chan struct{}
+	notified   atomic.Bool
+	applyCount atomic.Int32
 }
 
 func (g *notifyingWaitGate) Budget(ctx context.Context) float64 {
@@ -2488,10 +2660,27 @@ func (g *notifyingWaitGate) Budget(ctx context.Context) float64 {
 }
 
 func (g *notifyingWaitGate) Apply(ctx context.Context, _ *asyncapi.InternalRequest, _ *[]pipeline.GateReleaseFunc) (pipeline.Verdict, error) {
+	g.applyCount.Add(1)
 	if g.applied != nil && !g.notified.Swap(true) {
 		close(g.applied)
 	}
 	return pipeline.Wait(), nil
+}
+
+type waitThenContinueGate struct {
+	waits int32
+	calls atomic.Int32
+}
+
+func (g *waitThenContinueGate) Budget(context.Context) float64 {
+	return 1
+}
+
+func (g *waitThenContinueGate) Apply(context.Context, *asyncapi.InternalRequest, *[]pipeline.GateReleaseFunc) (pipeline.Verdict, error) {
+	if g.calls.Add(1) <= g.waits {
+		return pipeline.Wait(), nil
+	}
+	return pipeline.Continue(), nil
 }
 
 type signalContinueGate struct {
@@ -2540,12 +2729,17 @@ func TestWorker_PoolGateShutdownReenqueues(t *testing.T) {
 		close(done)
 	}()
 
-	requestChannel <- newEmb(asyncapi.RequestMessage{
+	msg := newEmb(asyncapi.RequestMessage{
 		ID:       "gate-shutdown-test",
 		Created:  time.Now().Unix(),
 		Deadline: time.Now().Add(30 * time.Second).Unix(),
-		Payload:  map[string]any{"model": "test", "prompt": "hi"},
+		Payload:  testPayload(map[string]any{"model": "test", "prompt": "hi"}),
 	}, "http://localhost:30800/v1/completions", nil)
+	msg.QueueID = "gate-shutdown-q"
+	msg.RequestQueueName = "gate-shutdown-queue"
+	metric := metrics.GateWaitRequeues.WithLabelValues(msg.QueueID, msg.RequestQueueName, msg.WorkerPoolID)
+	before := testutil.ToFloat64(metric)
+	requestChannel <- msg
 
 	// Let the worker block in poolGate.Apply, then cancel (simulating shutdown).
 	time.Sleep(50 * time.Millisecond)
@@ -2566,6 +2760,9 @@ func TestWorker_PoolGateShutdownReenqueues(t *testing.T) {
 	retryMsg := <-retryChannel
 	if retryMsg.PublicRequest.ReqID() != "gate-shutdown-test" {
 		t.Errorf("re-enqueued wrong message: got ID %q", retryMsg.PublicRequest.ReqID())
+	}
+	if got := testutil.ToFloat64(metric); got != before {
+		t.Errorf("shutdown changed gate-wait requeues to %v, want %v", got, before)
 	}
 }
 
@@ -2588,12 +2785,17 @@ func TestWorker_PoolGateActionWaitShutdownReenqueues(t *testing.T) {
 		close(done)
 	}()
 
-	requestChannel <- newEmb(asyncapi.RequestMessage{
+	msg := newEmb(asyncapi.RequestMessage{
 		ID:       "gate-wait-shutdown-test",
 		Created:  time.Now().Unix(),
 		Deadline: time.Now().Add(30 * time.Second).Unix(),
-		Payload:  map[string]any{"model": "test", "prompt": "hi"},
+		Payload:  testPayload(map[string]any{"model": "test", "prompt": "hi"}),
 	}, "http://localhost:30800/v1/completions", nil)
+	msg.QueueID = "gate-wait-shutdown-q"
+	msg.RequestQueueName = "gate-wait-shutdown-queue"
+	metric := metrics.GateWaitRequeues.WithLabelValues(msg.QueueID, msg.RequestQueueName, msg.WorkerPoolID)
+	before := testutil.ToFloat64(metric)
+	requestChannel <- msg
 
 	// Let the worker enter the ActionWait polling loop, then cancel (simulating shutdown).
 	time.Sleep(50 * time.Millisecond)
@@ -2614,6 +2816,9 @@ func TestWorker_PoolGateActionWaitShutdownReenqueues(t *testing.T) {
 	retryMsg := <-retryChannel
 	if retryMsg.PublicRequest.ReqID() != "gate-wait-shutdown-test" {
 		t.Errorf("re-enqueued wrong message: got ID %q", retryMsg.PublicRequest.ReqID())
+	}
+	if got := testutil.ToFloat64(metric); got != before {
+		t.Errorf("shutdown changed gate-wait requeues to %v, want %v", got, before)
 	}
 }
 
@@ -2641,7 +2846,7 @@ func TestWorker_PoolGateActionWaitHonorsCancellation(t *testing.T) {
 		ID:       msgID,
 		Created:  time.Now().Unix(),
 		Deadline: time.Now().Add(30 * time.Second).Unix(),
-		Payload:  map[string]any{"model": "test", "prompt": "hi"},
+		Payload:  testPayload(map[string]any{"model": "test", "prompt": "hi"}),
 	}, "http://localhost:30800/v1/completions", nil)
 
 	select {
@@ -2699,7 +2904,7 @@ func TestWorker_RechecksCancellationAfterGateContinue(t *testing.T) {
 		ID:       msgID,
 		Created:  time.Now().Unix(),
 		Deadline: time.Now().Add(30 * time.Second).Unix(),
-		Payload:  map[string]any{"model": "test", "prompt": "hi"},
+		Payload:  testPayload(map[string]any{"model": "test", "prompt": "hi"}),
 	}, "http://localhost:30800/v1/completions", nil)
 
 	select {
@@ -2758,7 +2963,7 @@ func TestWorker_RechecksCancellationImmediatelyBeforeSend(t *testing.T) {
 		ID:       msgID,
 		Created:  time.Now().Unix(),
 		Deadline: time.Now().Add(30 * time.Second).Unix(),
-		Payload:  map[string]any{"model": "test", "prompt": "hi"},
+		Payload:  testPayload(map[string]any{"model": "test", "prompt": "hi"}),
 	}, "http://localhost:30800/v1/completions", nil)
 
 	select {
@@ -2834,7 +3039,7 @@ func TestWorker_QueueGateAndPoolGateRace(t *testing.T) {
 			ID:       "req-race-test",
 			Created:  time.Now().Unix(),
 			Deadline: time.Now().Add(5 * time.Minute).Unix(),
-			Payload:  map[string]any{"model": "test"},
+			Payload:  testPayload(map[string]any{"model": "test"}),
 		},
 	)
 	var queueReleases []pipeline.GateReleaseFunc
@@ -2926,7 +3131,7 @@ func TestWorker_PoolGateDecisionsMetrics(t *testing.T) {
 			ID:       "req-dropped",
 			Created:  time.Now().Unix(),
 			Deadline: time.Now().Add(30 * time.Second).Unix(),
-			Payload:  map[string]any{"model": "test"},
+			Payload:  testPayload(map[string]any{"model": "test"}),
 		}, "http://localhost:30800/v1/completions", nil)
 		msg.WorkerPoolID = poolID
 		requestChannel <- msg
@@ -2964,7 +3169,7 @@ func TestWorker_PoolGateDecisionsMetrics(t *testing.T) {
 			ID:       "req-closed",
 			Created:  time.Now().Unix(),
 			Deadline: time.Now().Add(30 * time.Second).Unix(),
-			Payload:  map[string]any{"model": "test"},
+			Payload:  testPayload(map[string]any{"model": "test"}),
 		}, "http://localhost:30800/v1/completions", nil)
 		msg.WorkerPoolID = poolID
 		requestChannel <- msg
@@ -3004,7 +3209,7 @@ func TestWorker_PoolGateDecisionsMetrics(t *testing.T) {
 				ID:       "req-quota",
 				Created:  time.Now().Unix(),
 				Deadline: time.Now().Add(30 * time.Second).Unix(),
-				Payload:  map[string]any{"model": "test"},
+				Payload:  testPayload(map[string]any{"model": "test"}),
 			},
 		)
 		ir.SetClassification(asyncapi.ClassificationOverflow)
@@ -3048,7 +3253,7 @@ func TestWorker_PoolGateDecisionsMetrics(t *testing.T) {
 			ID:       "req-error",
 			Created:  time.Now().Unix(),
 			Deadline: time.Now().Add(30 * time.Second).Unix(),
-			Payload:  map[string]any{"model": "test"},
+			Payload:  testPayload(map[string]any{"model": "test"}),
 		}, "http://localhost:30800/v1/completions", nil)
 		msg.WorkerPoolID = poolID
 		requestChannel <- msg
@@ -3086,7 +3291,7 @@ func TestWorker_PoolGateDecisionsMetrics(t *testing.T) {
 			ID:       "req-wait",
 			Created:  time.Now().Unix(),
 			Deadline: time.Now().Add(30 * time.Second).Unix(),
-			Payload:  map[string]any{"model": "test"},
+			Payload:  testPayload(map[string]any{"model": "test"}),
 		}, "http://localhost:30800/v1/completions", nil)
 		msg.WorkerPoolID = poolID
 		requestChannel <- msg
@@ -3126,7 +3331,7 @@ func TestDeadlineAbortedSendClassifiedAsDeadlineExceeded(t *testing.T) {
 		ID:       msgId,
 		Created:  time.Now().Unix(),
 		Deadline: time.Now().Add(1 * time.Second).Unix(),
-		Payload:  map[string]any{"model": "m", "prompt": "hi"},
+		Payload:  testPayload(map[string]any{"model": "m", "prompt": "hi"}),
 	}, "http://localhost:30800/v1/completions", map[string]string{})
 
 	select {
@@ -3139,4 +3344,90 @@ func TestDeadlineAbortedSendClassifiedAsDeadlineExceeded(t *testing.T) {
 	case <-time.After(10 * time.Second):
 		t.Fatal("timed out waiting for result")
 	}
+}
+
+func TestValidateAndMarshal_ForwardsPayloadBytes(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		payload json.RawMessage
+		want    string
+	}{
+		{name: "verbatim", payload: json.RawMessage(`{"z":1, "a":[2,  3]}`), want: `{"z":1, "a":[2,  3]}`},
+		{name: "missing payload", payload: nil, want: `null`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			resultChannel := make(chan asyncapi.ResultMessage, 1)
+			msg := newEmb(asyncapi.RequestMessage{
+				ID: "fwd", Created: time.Now().Unix(), Deadline: time.Now().Add(time.Minute).Unix(),
+				Payload: tc.payload,
+			}, "http://localhost/v1/completions", nil)
+			got := validateAndMarshal(context.Background(), resultChannel, msg, nil)
+			if string(got) != tc.want {
+				t.Fatalf("body = %s, want %s", got, tc.want)
+			}
+			select {
+			case r := <-resultChannel:
+				t.Fatalf("unexpected result %+v", r)
+			default:
+			}
+		})
+	}
+}
+
+func TestWorker_SpanPrefersRequestModel(t *testing.T) {
+	exporter := setupTestTracer(t)
+	httpclient := NewTestClient(func(req *http.Request) (*http.Response, error) {
+		return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(bytes.NewReader(nil)), Header: make(http.Header)}, nil
+	})
+	inferenceClient := NewHTTPInferenceClient(httpclient)
+	requestChannel := make(chan pipeline.EmbelishedRequestMessage, 1)
+	retryChannel := make(chan pipeline.RetryMessage, 1)
+	resultChannel := make(chan asyncapi.ResultMessage, 1)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	go Worker(ctx, ctx, pipeline.Characteristics{}, inferenceClient, requestChannel, retryChannel, resultChannel, defaultRequestTimeout, nil)
+
+	requestChannel <- newEmb(asyncapi.RequestMessage{
+		ID: "span-model-field", Created: time.Now().Unix(), Deadline: time.Now().Add(100 * time.Second).Unix(),
+		Payload: testPayload(map[string]any{"model": "from-payload"}),
+		Model:   "from-request",
+	}, "http://localhost:30800/v1/completions", nil)
+
+	select {
+	case <-resultChannel:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timeout waiting for result")
+	}
+
+	s := findSpan(getSpansEventually(t, exporter, 1), "process-request")
+	if s == nil {
+		t.Fatal("expected 'process-request' span")
+	}
+	assertSpanAttributes(t, s, attribute.String("gen_ai.request.model", "from-request"))
+}
+
+func TestPayloadModel(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		payload string
+		want    string
+	}{
+		{"model present", `{"model":"payload"}`, "payload"},
+		{"no model key", `{"prompt":"hello"}`, ""},
+		{"unparseable", `{not json`, ""},
+		{"empty", ``, ""},
+	} {
+		if got := payloadModel(json.RawMessage(tc.payload)); got != tc.want {
+			t.Errorf("%s: payloadModel = %q, want %q", tc.name, got, tc.want)
+		}
+	}
+}
+
+func testPayload(m map[string]any) json.RawMessage {
+	b, err := json.Marshal(m)
+	if err != nil {
+		panic(err)
+	}
+	return b
 }
