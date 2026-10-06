@@ -37,11 +37,11 @@ func newClaimTestFlow(t *testing.T) (*miniredis.Miniredis, *redis.Client, contex
 
 func claimEnvelope(t *testing.T, id string, deadline int64) (*api.InternalRequest, string) {
 	t.Helper()
-	ir := api.NewInternalRequest(api.InternalRouting{RequestQueueName: "q"}, &api.RequestMessage{
+	ir := api.NewInternalRequest(api.InternalRouting{RequestQueueName: "q", EnqueueSeq: 3}, &api.RequestMessage{
 		ID:       id,
 		Created:  time.Now().Unix(),
 		Deadline: deadline,
-		Payload:  map[string]any{"model": "m", "prompt": "p"},
+		Payload:  testPayload(map[string]any{"model": "m", "prompt": "p"}),
 	})
 	b, err := json.Marshal(ir)
 	if err != nil {
@@ -148,11 +148,11 @@ func TestAckResult_PushesOnceThenFencesDuplicates(t *testing.T) {
 		t.Fatalf("claim: ok=%v err=%v", ok, err)
 	}
 
-	pushed, err := flow.ackResult(ctx, "q", "results", "c1", ir.RequestToken, `{"id":"c1"}`, 0)
+	pushed, err := flow.ackResult(ctx, "q", "results", "c1", ir.RequestToken, "", `{"id":"c1"}`, 0)
 	if err != nil || !pushed {
 		t.Fatalf("first ack: pushed=%v err=%v", pushed, err)
 	}
-	pushed, err = flow.ackResult(ctx, "q", "results", "c1", ir.RequestToken, `{"id":"c1"}`, 0)
+	pushed, err = flow.ackResult(ctx, "q", "results", "c1", ir.RequestToken, "", `{"id":"c1"}`, 0)
 	// Second ack after handle deletion and owner removal must be fenced (returns false, nil).
 	if err != nil || pushed {
 		t.Fatalf("second ack should be fenced: pushed=%v err=%v, want false/nil", pushed, err)
@@ -176,7 +176,7 @@ func TestAckResult_StaleTokenLeavesForeignClaimIntact(t *testing.T) {
 	rdb.HSet(ctx, keys.owners, "c1", "foreign-token")
 	rdb.ZAdd(ctx, keys.idx, redis.Z{Score: float64(time.Now().Add(time.Hour).Unix()), Member: "c1"})
 
-	pushed, err := flow.ackResult(ctx, "q", "results", "c1", "", `{"id":"c1"}`, 0)
+	pushed, err := flow.ackResult(ctx, "q", "results", "c1", "", "", `{"id":"c1"}`, 0)
 	if err != nil || pushed {
 		t.Fatalf("stale ack should be fenced: pushed=%v err=%v", pushed, err)
 	}
@@ -191,7 +191,7 @@ func TestAckResult_StaleTokenLeavesForeignClaimIntact(t *testing.T) {
 func TestReclaimExpiredClaims_RedeliversOnlyLapsedLeases(t *testing.T) {
 	_, rdb, ctx, flow := newClaimTestFlow(t)
 
-	// Expired claim: redelivered at its original sort score. A negative lease
+	// Expired claim: redelivered at its queue score. A negative lease
 	// TTL puts the expiry in the past deterministically (lease scores have
 	// whole-second granularity).
 	flow.claimLeaseTTL = -2 * time.Second
@@ -216,8 +216,12 @@ func TestReclaimExpiredClaims_RedeliversOnlyLapsedLeases(t *testing.T) {
 	if released != 1 {
 		t.Fatalf("released = %d, want 1", released)
 	}
-	if _, err := rdb.ZScore(ctx, "q", memberE).Result(); err != nil {
+	score, err := rdb.ZScore(ctx, "q", memberE).Result()
+	if err != nil {
 		t.Fatalf("expired request not redelivered: %v", err)
+	}
+	if want := irE.QueueScore(); score != want {
+		t.Errorf("redelivered score = %v, want %v", score, want)
 	}
 	if exists, _ := rdb.HExists(ctx, newClaimKeys("q").claimed, "live").Result(); !exists {
 		t.Fatal("live claim was reclaimed")
@@ -358,7 +362,7 @@ func TestClaimRequest_MultipleGenerationsSameReqID_DoNotOverwrite(t *testing.T) 
 	}
 
 	// Ack Gen 1
-	pushed1, err := flow.ackResult(ctx, "q", "result-list", "shared-id", "token-gen1", `{"id":"shared-id"}`, 0)
+	pushed1, err := flow.ackResult(ctx, "q", "result-list", "shared-id", "token-gen1", "", `{"id":"shared-id"}`, 0)
 	if !pushed1 || err != nil {
 		t.Fatalf("ack gen1: pushed=%v err=%v", pushed1, err)
 	}
@@ -372,7 +376,7 @@ func TestClaimRequest_MultipleGenerationsSameReqID_DoNotOverwrite(t *testing.T) 
 	}
 
 	// Ack Gen 2
-	pushed2, err := flow.ackResult(ctx, "q", "result-list", "shared-id", "token-gen2", `{"id":"shared-id"}`, 0)
+	pushed2, err := flow.ackResult(ctx, "q", "result-list", "shared-id", "token-gen2", "", `{"id":"shared-id"}`, 0)
 	if !pushed2 || err != nil {
 		t.Fatalf("ack gen2: pushed=%v err=%v", pushed2, err)
 	}

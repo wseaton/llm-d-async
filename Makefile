@@ -87,22 +87,35 @@ help: ## Display this help.
 ##@ Development
 
 .PHONY: fmt
-fmt: ## Run go fmt against root, api, and producer modules.
+fmt: ## Run go fmt against root, api, producer, and producer-sql modules.
 	go fmt ./...
 	cd api && go fmt ./...
 	cd producer && GOWORK=off go fmt ./...
+	cd producer-sql && GOWORK=off go fmt ./...
 
 .PHONY: vet
-vet: ## Run go vet against root, api, and producer modules.
+vet: ## Run go vet against root, api, producer, and producer-sql modules.
 	go vet ./...
 	cd api && go vet ./...
 	cd producer && GOWORK=off go vet ./...
+	cd producer-sql && GOWORK=off go vet ./...
 
 .PHONY: test
-test: fmt vet setup-envtest ## Run tests against root, api, and producer modules.
+test: fmt vet setup-envtest ## Run tests against root, api, producer, and producer-sql modules.
 	KUBEBUILDER_ASSETS="$(shell $(ENVTEST) use $(ENVTEST_K8S_VERSION) --bin-dir $(LOCALBIN) -p path)" go test $$(go list ./... | grep -v /e2e) -coverprofile cover.out
 	cd api && go test ./... -coverprofile=cover-api.out
 	cd producer && GOWORK=off go test ./... -coverprofile=cover-producer.out
+	cd producer-sql && GOWORK=off go test -p 1 ./... -coverprofile=cover-producer-sql.out
+
+.PHONY: test-sql
+test-sql: ## Run the Postgres-backed sql transport tests. Requires TEST_POSTGRES_URL.
+	@test -n "$(TEST_POSTGRES_URL)" || { echo "TEST_POSTGRES_URL is required, e.g. postgres://postgres@localhost:5432/asyncq_test?sslmode=disable"; exit 1; }
+	cd producer-sql && GOWORK=off go test -p 1 ./...
+	go test -p 1 ./pkg/sqlflow/... ./pkg/async/inference/flowcontrol/...
+
+.PHONY: bench
+bench: ## Run microbenchmarks. Set BENCH_REDIS_ADDR=host:port to measure against a real Redis instead of miniredis.
+	go test -run=^$$ -bench=. -benchmem ./pkg/redis/...
 
 # Creates a multi-node Kind cluster
 # Adds emulated GPU labels and capacities per node
@@ -150,20 +163,22 @@ undeploy-ap-on-k8s:
 # The suite deploys the async-processor, EPP, llm-d-inference-sim, Envoy,
 # Prometheus, and Redis into a Kind cluster.
 #
-# By default the EPP image is pulled from the registry and InferencePool CRDs
-# are fetched from the GAIE GitHub repo at the matching tag. Set GAIE_ROOT to a
-# local gateway-api-inference-extension checkout to build EPP from source and
-# use that checkout's CRDs instead.
+# By default the router main EPP image is pulled from the registry. InferencePool
+# CRDs come from GAIE; objective/model-rewrite CRDs come from llm-d-router.
+# Set ROUTER_ROOT to build EPP and use router CRDs from a local router checkout.
+# Set GAIE_ROOT to use InferencePool CRDs from a local GAIE checkout.
 #
 # The llm-d-inference-sim image is pulled from the registry by default.
 # Set SIM_ROOT to build from a local checkout instead.
 #
 # Optional env vars:
-#   GAIE_ROOT        — GAIE checkout; enables local EPP build and CRDs
+#   GAIE_ROOT        — GAIE checkout for InferencePool CRDs
+#   ROUTER_ROOT      — router checkout for local EPP build and router CRDs
+#   ROUTER_VERSION   — router ref for CRD fetch        (default: main; must match EPP_IMAGE)
 #   SIM_ROOT         — llm-d-inference-sim checkout; enables local sim build
 #   AP_IMAGE         — async-processor image tag        (default: $(IMAGE_TAG_BASE)/llm-d-async:e2e-test)
-#   EPP_IMAGE        — EPP image tag                    (default: ghcr.io/llm-d/llm-d-router-endpoint-picker:v0.9.0)
-#   GAIE_VERSION     — GAIE release for CRD fetch       (default: v1.5.0; must match the EPP image's pinned gaie)
+#   EPP_IMAGE        — EPP image tag                    (default: ghcr.io/llm-d/llm-d-router-endpoint-picker:main)
+#   GAIE_VERSION     — GAIE release for CRD fetch       (default: v1.6.2; must match the EPP image's pinned gaie)
 #   SIM_IMAGE        — inference-sim image tag          (default: ghcr.io/llm-d/llm-d-inference-sim:v0.0.0-test)
 #   REDIS_IMAGE      — Redis/Valkey image for E2E MQ    (default: valkey/valkey:8-alpine)
 #   PUBSUB_IMAGE     — Pub/Sub emulator image tag       (default: gcr.io/google.com/cloudsdktool/google-cloud-cli:emulators)

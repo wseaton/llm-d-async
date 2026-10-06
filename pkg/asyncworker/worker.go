@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"math"
 	"math/rand"
+	"sync/atomic"
 	"time"
 
 	"github.com/go-logr/logr"
@@ -28,7 +29,12 @@ const (
 	baseDelaySeconds = 2
 	maxDelaySeconds  = 60
 
-	gateWaitPollInterval              = 50 * time.Millisecond
+	// DefaultGateWaitTimeout bounds how long one worker parks a message at a
+	// pool gate before recoverably returning it to the broker. It is deliberately
+	// independent of the timeout for a downstream inference attempt.
+	DefaultGateWaitTimeout            = 5 * time.Minute
+	gateWaitInitialBackoff            = 100 * time.Millisecond
+	gateWaitMaxBackoff                = 1 * time.Second
 	cancellationCheckPollInterval     = 1 * time.Second
 	cancellationCheckRetryAfterSecond = 1.0
 )
@@ -40,6 +46,14 @@ func Worker(consumeCtx, requestCtx context.Context, characteristics pipeline.Cha
 
 func WorkerWithGate(consumeCtx, requestCtx context.Context, characteristics pipeline.Characteristics, client asyncapi.InferenceClient, requestChannel chan pipeline.EmbelishedRequestMessage,
 	retryChannel chan pipeline.RetryMessage, resultChannel chan asyncapi.ResultMessage, requestTimeout time.Duration, transforms *transform.Chain, poolGate pipeline.Gate) {
+	WorkerWithGateTimeout(consumeCtx, requestCtx, characteristics, client, requestChannel, retryChannel, resultChannel, requestTimeout, DefaultGateWaitTimeout, transforms, poolGate)
+}
+
+// WorkerWithGateTimeout runs a worker with separate downstream-request and
+// pool-gate wait timeouts. Expiring gateWaitTimeout requeues the message; only
+// the request's own deadline produces a terminal deadline result.
+func WorkerWithGateTimeout(consumeCtx, requestCtx context.Context, characteristics pipeline.Characteristics, client asyncapi.InferenceClient, requestChannel chan pipeline.EmbelishedRequestMessage,
+	retryChannel chan pipeline.RetryMessage, resultChannel chan asyncapi.ResultMessage, requestTimeout, gateWaitTimeout time.Duration, transforms *transform.Chain, poolGate pipeline.Gate) {
 
 	logger := log.FromContext(requestCtx)
 	for {
@@ -106,18 +120,66 @@ func WorkerWithGate(consumeCtx, requestCtx context.Context, characteristics pipe
 				}()
 
 				if poolGate != nil {
-					reqDeadline := time.Now().Add(requestTimeout)
+					var gateDeadline time.Time
+					if gateWaitTimeout > 0 {
+						gateDeadline = time.Now().Add(gateWaitTimeout)
+					}
 					if dline := msg.PublicRequest.ReqDeadline(); dline > 0 {
-						if msgDeadline := time.Unix(dline, 0); msgDeadline.Before(reqDeadline) {
-							reqDeadline = msgDeadline
+						if msgDeadline := time.Unix(dline, 0); gateDeadline.IsZero() || msgDeadline.Before(gateDeadline) {
+							gateDeadline = msgDeadline
 						}
 					}
-					gateCtx, cancelGate := context.WithDeadline(requestCtx, reqDeadline)
+					var gateCtx context.Context
+					var cancelGate context.CancelFunc
+					if gateDeadline.IsZero() {
+						gateCtx, cancelGate = context.WithCancel(requestCtx)
+					} else {
+						gateCtx, cancelGate = context.WithDeadline(requestCtx, gateDeadline)
+					}
 					defer cancelGate()
+
+					// Track gate-wait occupancy for autoscaler visibility.
+					gateWaiting := false
+					defer func() {
+						if gateWaiting {
+							metrics.DecGateWaiting(queueID, queueName, msg.WorkerPoolID)
+						}
+					}()
+
+					finishGateContext := func() {
+						// Shutdown/drain cancellation and the operational gate-wait
+						// timeout are recoverable. Only the request's public deadline
+						// is a terminal condition.
+						if requestCtx.Err() == nil && requestDeadlineReached(msg.PublicRequest, time.Now()) {
+							metrics.RecordExceededDeadlineReq(queueID, queueName, msg.WorkerPoolID)
+							select {
+							case resultChannel <- asyncapi.NewDeadlineExceededResult(msg.PublicRequest, msg.InternalRouting):
+							case <-requestCtx.Done():
+							}
+							return
+						}
+						if requestCtx.Err() == nil && errors.Is(gateCtx.Err(), context.DeadlineExceeded) {
+							metrics.RecordGateWaitRequeue(queueID, queueName, msg.WorkerPoolID)
+						}
+						select {
+						case retryChannel <- pipeline.RetryMessage{
+							EmbelishedRequestMessage: msg,
+							BackoffDurationSeconds:   0,
+						}:
+						case <-requestCtx.Done():
+							// retryWorker outlives workers during normal shutdown, so
+							// preserve the message even after requestCtx is cancelled.
+							retryChannel <- pipeline.RetryMessage{
+								EmbelishedRequestMessage: msg,
+								BackoffDurationSeconds:   0,
+							}
+						}
+					}
 
 					var verdict pipeline.Verdict
 					var err error
 					var waitRecorded bool
+					gateWaitBackoff := gateWaitInitialBackoff
 					for {
 						if emitCancelledResultIfNeeded(requestCtx, logger, retryChannel, resultChannel, msg, &nextCancellationCheck) {
 							return
@@ -126,18 +188,7 @@ func WorkerWithGate(consumeCtx, requestCtx context.Context, characteristics pipe
 						verdict, err = poolGate.Apply(gateCtx, msg.InternalRequest, &poolReleases)
 						if err != nil {
 							if errors.Is(err, context.DeadlineExceeded) || gateCtx.Err() != nil {
-								if requestCtx.Err() != nil && !errors.Is(requestCtx.Err(), context.DeadlineExceeded) {
-									retryChannel <- pipeline.RetryMessage{
-										EmbelishedRequestMessage: msg,
-										BackoffDurationSeconds:   0,
-									}
-									return
-								}
-								metrics.RecordExceededDeadlineReq(queueID, queueName, msg.WorkerPoolID)
-								select {
-								case resultChannel <- asyncapi.NewDeadlineExceededResult(msg.PublicRequest, msg.InternalRouting):
-								case <-requestCtx.Done():
-								}
+								finishGateContext()
 								return
 							}
 							metrics.RecordGateDecision(metrics.ReasonError, "", "", msg.WorkerPoolID)
@@ -149,6 +200,10 @@ func WorkerWithGate(consumeCtx, requestCtx context.Context, characteristics pipe
 						}
 
 						if verdict.Action == pipeline.ActionContinue {
+							if gateWaiting {
+								metrics.DecGateWaiting(queueID, queueName, msg.WorkerPoolID)
+								gateWaiting = false
+							}
 							break
 						}
 
@@ -193,23 +248,23 @@ func WorkerWithGate(consumeCtx, requestCtx context.Context, characteristics pipe
 								metrics.RecordGateDecision(reason, "", "", msg.WorkerPoolID)
 								waitRecorded = true
 							}
+							if !gateWaiting {
+								metrics.IncGateWaiting(queueID, queueName, msg.WorkerPoolID)
+								gateWaiting = true
+							}
+							waitTimer := time.NewTimer(jitteredGateWait(gateWaitBackoff))
 							select {
 							case <-gateCtx.Done():
-								if requestCtx.Err() != nil && !errors.Is(requestCtx.Err(), context.DeadlineExceeded) {
-									retryChannel <- pipeline.RetryMessage{
-										EmbelishedRequestMessage: msg,
-										BackoffDurationSeconds:   0,
+								if !waitTimer.Stop() {
+									select {
+									case <-waitTimer.C:
+									default:
 									}
-									return
 								}
-								metrics.RecordExceededDeadlineReq(queueID, queueName, msg.WorkerPoolID)
-								select {
-								case resultChannel <- asyncapi.NewDeadlineExceededResult(msg.PublicRequest, msg.InternalRouting):
-								case <-requestCtx.Done():
-								}
+								finishGateContext()
 								return
-							case <-time.After(gateWaitPollInterval):
-								// poll again
+							case <-waitTimer.C:
+								gateWaitBackoff = nextGateWaitBackoff(gateWaitBackoff)
 							}
 						}
 					}
@@ -234,7 +289,8 @@ func WorkerWithGate(consumeCtx, requestCtx context.Context, characteristics pipe
 						attribute.Int(uotel.AttrRetryCount, msg.RetryCount),
 						attribute.Int(uotel.LegacyAttrRetryCount, msg.RetryCount),
 					}
-					if model, ok := msg.PublicRequest.ReqPayload()["model"].(string); ok && model != "" {
+					model := msg.PublicRequest.ReqModel()
+					if model != "" {
 						spanAttrs = append(spanAttrs, attribute.String(uotel.AttrRequestModel, model))
 					}
 					if queueID != "" {
@@ -253,6 +309,11 @@ func WorkerWithGate(consumeCtx, requestCtx context.Context, characteristics pipe
 						trace.WithAttributes(spanAttrs...),
 					)
 					defer span.End()
+					if model == "" && span.IsRecording() {
+						if fromPayload := payloadModel(msg.PublicRequest.ReqPayload()); fromPayload != "" {
+							span.SetAttributes(attribute.String(uotel.AttrRequestModel, fromPayload))
+						}
+					}
 
 					reqDeadline := time.Now().Add(requestTimeout)
 					if dline := msg.PublicRequest.ReqDeadline(); dline > 0 {
@@ -292,8 +353,11 @@ func WorkerWithGate(consumeCtx, requestCtx context.Context, characteristics pipe
 					}
 
 					logger.V(logutil.DEBUG).Info("Sending inference request", "url", msg.RequestURL)
+					metrics.RecordDispatchedReq(queueID, queueName, msg.WorkerPoolID)
 					inferenceStart := time.Now()
-					resp, err := client.SendRequest(reqCtx, msg.RequestURL, sendHeaders, sendPayload)
+					sendCtx, stopCancellationWatch := watchInflightCancellation(reqCtx, logger, msg)
+					resp, err := client.SendRequest(sendCtx, msg.RequestURL, sendHeaders, sendPayload)
+					cancelledInFlight := stopCancellationWatch()
 					metrics.RecordInferenceLatency(float64(time.Since(inferenceStart).Milliseconds()), queueID, queueName, msg.WorkerPoolID)
 
 					if err == nil {
@@ -323,6 +387,17 @@ func WorkerWithGate(consumeCtx, requestCtx context.Context, characteristics pipe
 						retryChannel <- pipeline.RetryMessage{
 							EmbelishedRequestMessage: msg,
 							BackoffDurationSeconds:   0,
+						}
+						return
+					}
+
+					// The request was cancelled by its producer while inference was
+					// executing. A terminal response that arrived first was already
+					// returned above; otherwise surface CANCELLED and do not retry.
+					if cancelledInFlight {
+						select {
+						case resultChannel <- asyncapi.NewCancelledResult(msg.PublicRequest, msg.InternalRouting):
+						case <-requestCtx.Done():
 						}
 						return
 					}
@@ -391,6 +466,25 @@ func WorkerWithGate(consumeCtx, requestCtx context.Context, characteristics pipe
 	}
 }
 
+func requestDeadlineReached(request asyncapi.Request, now time.Time) bool {
+	if request == nil || request.ReqDeadline() <= 0 {
+		return false
+	}
+	return !now.Before(time.Unix(request.ReqDeadline(), 0))
+}
+
+func nextGateWaitBackoff(current time.Duration) time.Duration {
+	if current >= gateWaitMaxBackoff/2 {
+		return gateWaitMaxBackoff
+	}
+	return current * 2
+}
+
+func jitteredGateWait(backoff time.Duration) time.Duration {
+	half := backoff / 2
+	return half + time.Duration(rand.Float64()*float64(backoff-half)) // #nosec G404 -- non-security jitter, crypto/rand unnecessary
+}
+
 // parsing and validating payload. On failure puts an error msg on the result-channel and returns nil
 func validateAndMarshal(ctx context.Context, resultChannel chan asyncapi.ResultMessage, msg pipeline.EmbelishedRequestMessage, transforms *transform.Chain) []byte {
 	if msg.PublicRequest == nil {
@@ -418,14 +512,9 @@ func validateAndMarshal(ctx context.Context, resultChannel chan asyncapi.ResultM
 		return nil
 	}
 
-	payloadBytes, err := json.Marshal(r.ReqPayload())
-	if err != nil {
-		metrics.RecordFailedReq(queueID, queueName, msg.WorkerPoolID)
-		select {
-		case resultChannel <- asyncapi.NewErrorResult(r, msg.InternalRouting, asyncapi.ErrCodeInvalidRequest, fmt.Sprintf("Failed to marshal message's payload: %s", err.Error())):
-		case <-ctx.Done():
-		}
-		return nil
+	payloadBytes := []byte(r.ReqPayload())
+	if len(payloadBytes) == 0 {
+		payloadBytes = []byte("null")
 	}
 
 	// Pre-dispatch transform validation (e.g. signed object URL expiry). A
@@ -569,6 +658,56 @@ func emitCancelledResultIfNeeded(
 	return true
 }
 
+// watchInflightCancellation polls the request's cancellation marker while
+// inference is executing and cancels the returned context once the marker for
+// this request generation appears. The returned stop function ends polling and
+// reports whether the watcher cancelled the send; it must be called once the
+// send returns. Without a cancellation checker, ctx is returned unchanged.
+func watchInflightCancellation(ctx context.Context, logger logr.Logger, msg pipeline.EmbelishedRequestMessage) (context.Context, func() bool) {
+	checker := cancellationCheckerFromContext(ctx)
+	if checker == nil || msg.PublicRequest == nil {
+		return ctx, func() bool { return false }
+	}
+	sendCtx, cancel := context.WithCancel(ctx)
+	var cancelled atomic.Bool
+	go func() {
+		ticker := time.NewTicker(cancellationCheckPollInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-sendCtx.Done():
+				return
+			case <-ticker.C:
+			}
+			isCancelled, err := checker.IsCancelled(sendCtx, msg.PublicRequest.ReqID(), msg.RequestToken)
+			if sendCtx.Err() != nil {
+				// The send already finished or was aborted while the lookup
+				// ran, so its answer no longer matters.
+				return
+			}
+			if err != nil {
+				// Fail open: a lookup error must not abort a request that may
+				// still complete. The next tick checks again.
+				logger.V(logutil.DEBUG).Info("Failed to check in-flight request cancellation", "id", msg.PublicRequest.ReqID(), "err", err)
+				continue
+			}
+			if isCancelled {
+				cancelled.Store(true)
+				cancel()
+				return
+			}
+		}
+	}()
+	// Stop does not wait for a lookup still in flight: the Redis client does
+	// not abort a command on context cancellation by default, so waiting would
+	// let a slow Redis delay the result of a send that already finished. The
+	// flag is set before the watcher cancels the send, so it is reliable here.
+	return sendCtx, func() bool {
+		cancel()
+		return cancelled.Load()
+	}
+}
+
 // https://aws.amazon.com/blogs/architecture/exponential-backoff-and-jitter/
 func expBackoffDuration(retryCount int, secondsToDeadline int) float64 {
 	if secondsToDeadline <= 0 {
@@ -588,4 +727,14 @@ func expBackoffDuration(retryCount int, secondsToDeadline int) float64 {
 	// equal jitter: [temp/2, temp)
 	half := temp / 2
 	return half + rand.Float64()*half // #nosec G404 -- non-security jitter, crypto/rand unnecessary
+}
+
+func payloadModel(payload json.RawMessage) string {
+	var p struct {
+		Model string `json:"model"`
+	}
+	if err := json.Unmarshal(payload, &p); err != nil {
+		return ""
+	}
+	return p.Model
 }

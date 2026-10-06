@@ -23,6 +23,7 @@ import (
 	"github.com/llm-d/llm-d-async/pkg/plugins"
 	"github.com/llm-d/llm-d-async/pkg/pubsub"
 	"github.com/llm-d/llm-d-async/pkg/redis"
+	"github.com/llm-d/llm-d-async/pkg/sqlflow"
 	"github.com/llm-d/llm-d-async/pkg/version"
 	"github.com/spf13/pflag"
 	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
@@ -119,7 +120,7 @@ func (r *Runner) Run(ctx context.Context) (err error) {
 		return err
 	}
 
-	if err = startMetricsServer(ctx, opts.Server, setupLog); err != nil {
+	if err = startMetricsServer(ctx, opts.Server); err != nil {
 		return err
 	}
 
@@ -152,8 +153,7 @@ func (r *Runner) Run(ctx context.Context) (err error) {
 				Owner: pipeline.GateOwner{WorkerPoolID: poolID},
 			})
 			if err != nil {
-				setupLog.Error(err, "Failed to create pool gate", "poolID", poolID, "gateType", pool.GateType)
-				os.Exit(1)
+				return fmt.Errorf("failed to create pool gate for pool %q (type %q): %w", poolID, pool.GateType, err)
 			}
 			poolGates[poolID] = gate
 			metrics.InitGateDecisions("", "", poolID)
@@ -172,7 +172,7 @@ func (r *Runner) Run(ctx context.Context) (err error) {
 			wg.Add(1)
 			go func(mergedChan chan pipeline.EmbelishedRequestMessage, poolGate pipeline.Gate) {
 				defer wg.Done()
-				asyncworker.WorkerWithGate(ctx, drainCtx, flow.Characteristics(), inferenceClient, mergedChan, flow.RetryChannel(), flow.ResultChannel(), opts.Worker.RequestTimeout, transforms, poolGate)
+				asyncworker.WorkerWithGateTimeout(ctx, drainCtx, flow.Characteristics(), inferenceClient, mergedChan, flow.RetryChannel(), flow.ResultChannel(), opts.Worker.RequestTimeout, opts.Worker.GateWaitTimeout, transforms, poolGate)
 			}(mergedChan, poolGate)
 		}
 	}
@@ -221,8 +221,7 @@ func (r *Runner) Run(ctx context.Context) (err error) {
 func initTracer(baseCtx context.Context) (func(context.Context) error, error) {
 	shutdown, err := uotel.InitTracer(baseCtx)
 	if err != nil {
-		logr.FromContextOrDiscard(baseCtx).Error(err, "Failed to initialize OpenTelemetry tracer")
-		return nil, err
+		return nil, fmt.Errorf("failed to initialize OpenTelemetry tracer: %w", err)
 	}
 	return shutdown, nil
 }
@@ -314,6 +313,13 @@ func loadFlow(opts *Options, gateFactory *flowcontrol.GateFactory, poolsMap map[
 		}
 		flow, err := redis.NewRedisSortedSetFlow(*cfg, workerPools, gateFactory)
 		return flow, cfg, err
+	case "sql":
+		cfg, err := sqlflow.LoadConfig(configBytes)
+		if err != nil {
+			return nil, nil, err
+		}
+		flow, err := sqlflow.New(context.Background(), *cfg, workerPools, gateFactory)
+		return flow, nil, err
 	case "gcp-pubsub":
 		cfg, err := pubsub.LoadConfig(configBytes)
 		if err != nil {
@@ -340,8 +346,7 @@ func initHealthServer(impl pipeline.Flow, serverCfg ServerConfig, setupLog logr.
 	healthServer := health.NewServer(serverCfg.HealthPort, checker, setupLog.WithName("health"))
 	healthLn, err := healthServer.ListenAndServe()
 	if err != nil {
-		setupLog.Error(err, "Failed to bind health server")
-		return nil, err
+		return nil, fmt.Errorf("failed to bind health server: %w", err)
 	}
 	go func() {
 		if err := healthServer.Serve(healthLn); err != nil {
@@ -351,7 +356,7 @@ func initHealthServer(impl pipeline.Flow, serverCfg ServerConfig, setupLog logr.
 	return healthServer, nil
 }
 
-func startMetricsServer(ctx context.Context, serverCfg ServerConfig, setupLog logr.Logger) error {
+func startMetricsServer(ctx context.Context, serverCfg ServerConfig) error {
 	metricsServerOptions := metricsserver.Options{
 		BindAddress: fmt.Sprintf(":%d", serverCfg.MetricsPort),
 		FilterProvider: func() func(c *rest.Config, httpClient *http.Client) (metricsserver.Filter, error) {
@@ -365,8 +370,7 @@ func startMetricsServer(ctx context.Context, serverCfg ServerConfig, setupLog lo
 
 	msrv, err := metricsserver.NewServer(metricsServerOptions, restConfig, http.DefaultClient)
 	if err != nil {
-		setupLog.Error(err, "Failed to create metrics server")
-		return err
+		return fmt.Errorf("failed to create metrics server: %w", err)
 	}
 	go msrv.Start(ctx) //nolint:errcheck
 	return nil
@@ -467,6 +471,7 @@ func pollBacklog(ctx context.Context, reporter pipeline.BacklogReporter, interva
 		for _, s := range stats {
 			current[queueLabels{id: s.QueueID, name: s.QueueName, pool: s.PoolName}] = struct{}{}
 			metrics.SetBrokerBacklog(s.QueueID, s.QueueName, s.PoolName, float64(s.Depth))
+			metrics.SetBrokerBacklogSourceAvailable(s.QueueID, s.QueueName, s.PoolName, s.SourceAvailable)
 			// Nil counts mean the broker cannot report per-item deadlines
 			// (e.g. Cloud Pub/Sub); emit nothing for it. When present they are
 			// exact cumulative bucket counts, zeroed on a failed read so the

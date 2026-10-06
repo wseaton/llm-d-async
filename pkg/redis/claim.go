@@ -66,7 +66,7 @@ redis.call('ZADD', KEYS[4], ARGV[4], ARGV[1])
 return 1
 `)
 
-// RELEASE hands a claimed request back to pending at deadline score.
+// RELEASE hands a claimed request back to pending at its queue score.
 // Token-guarded: a stale owner must not drop the new owner's claim.
 var releaseClaimScript = redis.NewScript(`
 if redis.call('HGET', KEYS[3], ARGV[1]) ~= ARGV[4] then
@@ -83,7 +83,7 @@ return 1
 // Only the current owner may publish; stale owners are fenced. Missing
 // owners or token mismatches return 0, preventing duplicate pushes.
 //
-// KEYS: claimed, owners, idx, resultList
+// KEYS: claimed, owners, idx, resultList, [payload]
 // ARGV: id, resultJSON, token, listTTLSeconds
 // Returns 1 when the result was recorded, 0 when fenced as stale.
 var ackResultScript = redis.NewScript(`
@@ -99,10 +99,13 @@ end
 redis.call('HDEL', KEYS[1], ARGV[1])
 redis.call('HDEL', KEYS[2], ARGV[1])
 redis.call('ZREM', KEYS[3], ARGV[1])
+if KEYS[5] then
+  redis.call('DEL', KEYS[5])
+end
 return 1
 `)
 
-// RECLAIMIFEXPIRED redelivers an expired claim back to pending at deadline
+// RECLAIMIFEXPIRED redelivers an expired claim back to pending at its queue
 // score; renewed claims and ghosts are left alone.
 var reclaimExpiredScript = redis.NewScript(`
 local exp = redis.call('ZSCORE', KEYS[4], ARGV[1])
@@ -216,12 +219,12 @@ func (r *RedisSortedSetFlow) claimRequest(ctx context.Context, queueName string,
 }
 
 // releaseClaim returns a claimed request to pending during graceful shutdown.
-func (r *RedisSortedSetFlow) releaseClaim(ctx context.Context, queueName string, requestID string, requestToken string, member string, deadline float64, token string) error {
+func (r *RedisSortedSetFlow) releaseClaim(ctx context.Context, queueName string, requestID string, requestToken string, member string, score float64, token string) error {
 	keys := newClaimKeys(queueName)
 	claimID := claimKey(requestID, requestToken)
 	err := releaseClaimScript.Run(ctx, r.rdb, []string{
 		keys.pending, keys.claimed, keys.owners, keys.idx,
-	}, claimID, member, deadline, token).Err()
+	}, claimID, member, score, token).Err()
 	if err != nil {
 		return fmt.Errorf("release claim for %q on queue %q: %w", requestID, queueName, err)
 	}
@@ -232,7 +235,7 @@ func (r *RedisSortedSetFlow) releaseClaim(ctx context.Context, queueName string,
 // ackResult records a terminal result (idempotently) and drops this flow's
 // claim. claimQueueName hosts the claim bookkeeping; resultList is the
 // resolved destination. pushed=false means a stale owner was fenced.
-func (r *RedisSortedSetFlow) ackResult(ctx context.Context, claimQueueName string, resultList string, requestID string, requestToken string, resultJSON string, listTTL time.Duration) (pushed bool, err error) {
+func (r *RedisSortedSetFlow) ackResult(ctx context.Context, claimQueueName string, resultList string, requestID string, requestToken string, payloadRef string, resultJSON string, listTTL time.Duration) (pushed bool, err error) {
 	// Peek the token rather than consuming it: if the script errors the
 	// caller may retry this ack, and the ownership proof must survive.
 	claimID := claimKey(requestID, requestToken)
@@ -247,9 +250,11 @@ func (r *RedisSortedSetFlow) ackResult(ctx context.Context, claimQueueName strin
 	if listTTL > 0 {
 		listTTLSec = int64(listTTL.Seconds())
 	}
-	res, err := ackResultScript.Run(ctx, r.rdb, []string{
-		keys.claimed, keys.owners, keys.idx, resultList,
-	}, claimID, resultJSON, token, listTTLSec).Int()
+	scriptKeys := []string{keys.claimed, keys.owners, keys.idx, resultList}
+	if payloadRef != "" {
+		scriptKeys = append(scriptKeys, payloadRef)
+	}
+	res, err := ackResultScript.Run(ctx, r.rdb, scriptKeys, claimID, resultJSON, token, listTTLSec).Int()
 	if err != nil {
 		return false, fmt.Errorf("ack result for %q: %w", requestID, err)
 	}
@@ -297,16 +302,16 @@ func (r *RedisSortedSetFlow) reclaimExpiredClaims(ctx context.Context) (released
 			if err != nil && err != redis.Nil {
 				return released, fmt.Errorf("read claim payload for %q: %w", id, err)
 			}
-			deadline := float64(0)
+			score := float64(0)
 			if err == nil {
 				var ir api.InternalRequest
 				if jsonErr := json.Unmarshal([]byte(payload), &ir); jsonErr == nil && ir.PublicRequest != nil {
-					deadline = float64(ir.PublicRequest.ReqDeadline())
+					score = ir.QueueScore()
 				}
 			}
 			res, err := reclaimExpiredScript.Run(ctx, r.rdb, []string{
 				keys.pending, keys.claimed, keys.owners, keys.idx,
-			}, id, deadline, now).Int()
+			}, id, score, now).Int()
 			if err != nil {
 				return released, fmt.Errorf("reclaim claim for %q on queue %q: %w", id, queueName, err)
 			}
