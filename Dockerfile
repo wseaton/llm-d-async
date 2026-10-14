@@ -2,16 +2,19 @@
 FROM quay.io/projectquay/golang:1.27 AS builder
 ARG TARGETOS
 ARG TARGETARCH
-ARG LDFLAGS
+# Linker flags. The Makefile and the release workflow pass the pkg/version
+# -X symbols; a bare build still gets a stripped binary.
+ARG LDFLAGS="-s -w"
 
 WORKDIR /workspace
 # Copy the Go Modules manifests
 COPY go.mod go.mod
 COPY go.sum go.sum
-# Local replace directives (./api, ./pipeline, ./producer) must exist before go mod download.
+# Local replace directives (./api, ./pipeline, ./producer, ./producer-sql) must exist before go mod download.
 COPY api/ api/
 COPY pipeline/ pipeline/
 COPY producer/ producer/
+COPY producer-sql/ producer-sql/
 # cache deps before building and copying source so that we don't need to re-download as much
 # and so that source changes don't invalidate our downloaded layer
 RUN go mod download

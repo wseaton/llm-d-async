@@ -18,12 +18,14 @@ package flowcontrol
 
 import (
 	"context"
+	"math"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/go-logr/logr/funcr"
 	"github.com/llm-d/llm-d-async/pipeline"
+	redisgate "github.com/llm-d/llm-d-async/pkg/redis"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -150,6 +152,53 @@ func TestGateFactory_RedisGateDifferentAddresses(t *testing.T) {
 	assert.NotNil(t, gate1)
 	assert.NotNil(t, gate2)
 	assert.Len(t, factory.redisClients, 2, "should create separate clients for different addresses")
+}
+
+func TestGateFactory_RedisLeasedRateGate(t *testing.T) {
+	factory := NewGateFactory("")
+	t.Cleanup(func() { assert.NoError(t, factory.Close()) })
+
+	gate, err := factory.CreateGate(pipeline.GateConfig{
+		GateType: "redis-leased-rate",
+		GateParams: map[string]any{
+			"address":       "localhost:6379",
+			"control_key":   "drain-limit:batch-pool",
+			"burst_seconds": "0.25",
+		},
+		Owner: pipeline.GateOwner{WorkerPoolID: "batch-pool"},
+	})
+	require.NoError(t, err)
+	assert.IsType(t, &redisgate.RedisLeasedRateGate{}, gate)
+}
+
+func TestGateFactory_RedisLeasedRateGateValidatesParams(t *testing.T) {
+	tests := []struct {
+		name   string
+		params map[string]any
+		owner  pipeline.GateOwner
+		want   string
+	}{
+		{name: "address", params: map[string]any{"control_key": "key"}, owner: pipeline.GateOwner{WorkerPoolID: "pool"}, want: "requires an 'address'"},
+		{name: "control key", params: map[string]any{"address": "localhost:6379"}, owner: pipeline.GateOwner{WorkerPoolID: "pool"}, want: "requires a 'control_key'"},
+		{name: "pool", params: map[string]any{"address": "localhost:6379", "control_key": "key"}, want: "requires a 'pool_id'"},
+		{name: "burst", params: map[string]any{"address": "localhost:6379", "control_key": "key", "burst_seconds": 0}, owner: pipeline.GateOwner{WorkerPoolID: "pool"}, want: "must be finite and positive"},
+		{name: "NaN burst", params: map[string]any{"address": "localhost:6379", "control_key": "key", "burst_seconds": math.NaN()}, owner: pipeline.GateOwner{WorkerPoolID: "pool"}, want: "must be finite and positive"},
+		{name: "infinite burst", params: map[string]any{"address": "localhost:6379", "control_key": "key", "burst_seconds": math.Inf(1)}, owner: pipeline.GateOwner{WorkerPoolID: "pool"}, want: "must be finite and positive"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			factory := NewGateFactory("")
+			t.Cleanup(func() { assert.NoError(t, factory.Close()) })
+			gate, err := factory.CreateGate(pipeline.GateConfig{
+				GateType:   "redis-leased-rate",
+				GateParams: tt.params,
+				Owner:      tt.owner,
+			})
+			assert.ErrorContains(t, err, tt.want)
+			assert.Nil(t, gate)
+		})
+	}
 }
 
 func TestGateFactory_BudgetGateWithoutURL(t *testing.T) {
@@ -280,8 +329,8 @@ func TestGateFactory_BudgetGateCascadeSources(t *testing.T) {
 	// Flow control stays first for installs that enable the plugin; the metric a
 	// stock EPP always exports is next, so the cascade resolves without it; vLLM
 	// last because it needs scrape-time relabeling to carry inference_pool.
-	assert.Contains(t, exprs[0], "inference_extension_flow_control_queue_size")
-	assert.Contains(t, exprs[1], "inference_pool_per_pod_queue_size")
+	assert.Contains(t, exprs[0], "llm_d_epp_flow_control_queue_size")
+	assert.Contains(t, exprs[1], "llm_d_epp_per_endpoint_queue_size")
 	assert.Contains(t, exprs[2], "vllm:num_requests_running")
 }
 
@@ -296,8 +345,8 @@ func TestGateFactory_BudgetGateLogsResolvedQueries(t *testing.T) {
 	require.NoError(t, err)
 
 	joined := strings.Join(logged, "\n")
-	assert.Contains(t, joined, "inference_extension_flow_control_queue_size")
-	assert.Contains(t, joined, "inference_pool_per_pod_queue_size")
+	assert.Contains(t, joined, "llm_d_epp_flow_control_queue_size")
+	assert.Contains(t, joined, "llm_d_epp_per_endpoint_queue_size")
 	assert.Contains(t, joined, "vllm:num_requests_running")
 
 	// The resolved closing point goes to the same logger as the source queries.

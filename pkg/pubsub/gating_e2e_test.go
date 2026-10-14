@@ -11,6 +11,7 @@ import (
 	"cloud.google.com/go/pubsub/v2"
 	"github.com/alicebob/miniredis/v2"
 	"github.com/llm-d/llm-d-async/api"
+	"github.com/llm-d/llm-d-async/pkg/async/inference/flowcontrol"
 	redisgate "github.com/llm-d/llm-d-async/pkg/redis"
 	"github.com/redis/go-redis/v9"
 )
@@ -42,7 +43,7 @@ func TestGating_EndToEnd(t *testing.T) {
 	}
 
 	t.Run("Concurrency Gating", func(t *testing.T) {
-		gate := redisgate.NewRedisQuotaGate(rdb, "userid", redisgate.QuotaModeConcurrency, 1, 10*time.Second, "e2e-concurrency:")
+		gate := flowcontrol.NewQuotaGate(redisgate.NewQuotaStore(rdb, 10*time.Second), "userid", flowcontrol.QuotaModeConcurrency, 1, 10*time.Second, "e2e-concurrency:")
 
 		// 1. Send Request 1 for User A
 		msg1 := createMsg("req-1", "user-a")
@@ -60,7 +61,7 @@ func TestGating_EndToEnd(t *testing.T) {
 				f(ctx, msg1)
 				return nil
 			}
-			_ = flow.processMessages(ctx, receive, "test-sub", "test-pool", ch, gate, nil)
+			_ = flow.processMessages(ctx, receive, "test-sub", "test-pool", ch, gate, nil, "")
 		}()
 
 		// Verification: Request 1 should reach the channel
@@ -84,7 +85,7 @@ func TestGating_EndToEnd(t *testing.T) {
 				return nil
 			}
 			// We expect this to return without putting anything in 'ch'
-			_ = flow.processMessages(ctx, receive, "test-sub", "test-pool", ch, gate, nil)
+			_ = flow.processMessages(ctx, receive, "test-sub", "test-pool", ch, gate, nil, "")
 			deniedChan <- true
 		}()
 
@@ -111,7 +112,7 @@ func TestGating_EndToEnd(t *testing.T) {
 				f(ctx, msg3)
 				return nil
 			}
-			_ = flow.processMessages(ctx, receive, "test-sub", "test-pool", ch, gate, nil)
+			_ = flow.processMessages(ctx, receive, "test-sub", "test-pool", ch, gate, nil, "")
 		}()
 
 		select {
@@ -126,7 +127,7 @@ func TestGating_EndToEnd(t *testing.T) {
 
 	t.Run("Rate Limit Gating", func(t *testing.T) {
 		// 2 requests per 2 seconds
-		gate := redisgate.NewRedisQuotaGate(rdb, "userid", redisgate.QuotaModeRateLimit, 2, 2*time.Second, "e2e-ratelimit:")
+		gate := flowcontrol.NewQuotaGate(redisgate.NewQuotaStore(rdb, 2*time.Second), "userid", flowcontrol.QuotaModeRateLimit, 2, 2*time.Second, "e2e-ratelimit:")
 
 		// Send 2 allowed requests
 		for i := 1; i <= 2; i++ {
@@ -137,7 +138,7 @@ func TestGating_EndToEnd(t *testing.T) {
 					f(ctx, msg)
 					return nil
 				}
-				_ = flow.processMessages(context.Background(), receive, "test-sub", "test-pool", ch, gate, nil)
+				_ = flow.processMessages(context.Background(), receive, "test-sub", "test-pool", ch, gate, nil, "")
 			}()
 
 			select {
@@ -160,7 +161,7 @@ func TestGating_EndToEnd(t *testing.T) {
 				f(ctx, msg3)
 				return nil
 			}
-			_ = flow.processMessages(context.Background(), receive, "test-sub", "test-pool", ch, gate, nil)
+			_ = flow.processMessages(context.Background(), receive, "test-sub", "test-pool", ch, gate, nil, "")
 			deniedChan <- true
 		}()
 
@@ -183,7 +184,7 @@ func TestGating_EndToEnd(t *testing.T) {
 				f(ctx, msg4)
 				return nil
 			}
-			_ = flow.processMessages(context.Background(), receive, "test-sub", "test-pool", ch, gate, nil)
+			_ = flow.processMessages(context.Background(), receive, "test-sub", "test-pool", ch, gate, nil, "")
 		}()
 
 		select {

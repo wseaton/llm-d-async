@@ -24,6 +24,17 @@ const (
 type Verdict struct {
 	Action VerdictAction
 	Result *api.ResultMessage
+	// Reason names why a Refuse or Wait verdict was issued and becomes the
+	// reason label of async_gate_decisions_total. Gates that leave it empty
+	// are recorded as gate_closed; a quota gate that refuses an over-quota
+	// request sets quota_exhausted. Wrapping gates pass it through.
+	Reason string
+}
+
+// WithReason returns a copy of the verdict carrying the given reason.
+func (v Verdict) WithReason(reason string) Verdict {
+	v.Reason = reason
+	return v
 }
 
 // Continue returns a verdict to proceed.
@@ -66,7 +77,8 @@ type Gate interface {
 	// A value of 1.0 indicates full capacity available (system is idle).
 	// The system always returns a valid value, even in case of internal error.
 	Budget(ctx context.Context) float64
-	// Apply applies the gating logic to a request.
+	// Apply applies the gating logic to a request. On queues that store payloads
+	// under their own keys, msg does not carry its payload yet.
 	Apply(ctx context.Context, msg *api.InternalRequest, releases *[]GateReleaseFunc) (Verdict, error)
 }
 
