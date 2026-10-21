@@ -16,7 +16,7 @@ const (
 )
 
 // Budget Cascade tests run while EPP is deployed WITHOUT flow control.
-// The primary metric (inference_extension_flow_control_queue_size) is never
+// The primary metric (llm_d_epp_flow_control_queue_size) is never
 // recorded, so the CascadeMetricSource falls past it — to EPP's per-pod queue
 // depth, or to vLLM metrics if that is empty too.
 var _ = ginkgo.Describe("Budget Cascade E2E", ginkgo.Ordered, func() {
@@ -31,7 +31,7 @@ var _ = ginkgo.Describe("Budget Cascade E2E", ginkgo.Ordered, func() {
 
 	ginkgo.It("falls back to a later source when primary metric is unavailable", func() {
 		// EPP was deployed without flow control by BeforeSuite, so
-		// inference_extension_flow_control_queue_size is never recorded and the
+		// llm_d_epp_flow_control_queue_size is never recorded and the
 		// cascade skips source 0. Source 1 reads EPP's per-pod queue depth:
 		//   D = 1 - (mean per-pod queue depth / max_concurrency)
 		// and if that is empty, source 2 reads vLLM metrics:
@@ -57,7 +57,7 @@ var _ = ginkgo.Describe("Budget Cascade E2E", ginkgo.Ordered, func() {
 //
 //	D = 1 - (queue_size / (ready_pods * max_concurrency))
 //
-// where queue_size is inference_extension_flow_control_queue_size (EPP's
+// where queue_size is llm_d_epp_flow_control_queue_size (EPP's
 // internal flow control admission queue depth).
 //
 // To drive queue_size > 0, the tests flood EPP with concurrent probe
@@ -79,7 +79,7 @@ var _ = ginkgo.Describe("Budget Metric Dispatch Gate E2E", ginkgo.Ordered, func(
 		// Previous tests may have left probes queued.
 		setSimWaitingRequests(simAdminURL, 0)
 		gomega.Eventually(func() bool {
-			v := queryProm(promURL, budgetPromQL)
+			v := queryProm(promURL, budgetPromQL(promURL))
 			return !math.IsNaN(v) && v > 0.5
 		}, 60*time.Second, 2*time.Second).Should(gomega.BeTrue(), "waiting for budget to recover between tests")
 	})
@@ -112,7 +112,7 @@ var _ = ginkgo.Describe("Budget Metric Dispatch Gate E2E", ginkgo.Ordered, func(
 		// sim fake_metrics → EPP scrapes sim → EPP detects saturation →
 		// EPP throttles flood probes → queue_size rises → Prometheus scrapes.
 		gomega.Eventually(func() bool {
-			v := queryProm(promURL, budgetPromQL)
+			v := queryProm(promURL, budgetPromQL(promURL))
 			return !math.IsNaN(v) && v < 0.05
 		}, 120*time.Second, 2*time.Second).Should(gomega.BeTrue(), "waiting for budget to reach zero")
 
@@ -144,7 +144,7 @@ var _ = ginkgo.Describe("Budget Metric Dispatch Gate E2E", ginkgo.Ordered, func(
 		defer stopFlood()
 
 		gomega.Eventually(func() bool {
-			v := queryProm(promURL, budgetPromQL)
+			v := queryProm(promURL, budgetPromQL(promURL))
 			return !math.IsNaN(v) && v < 0.05
 		}, 120*time.Second, 2*time.Second).Should(gomega.BeTrue(), "waiting for budget to reach zero")
 

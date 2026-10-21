@@ -16,11 +16,13 @@ import (
 	"cloud.google.com/go/pubsub/v2/apiv1/pubsubpb"
 	"github.com/onsi/ginkgo/v2"
 	"github.com/onsi/gomega"
+	promapi "github.com/prometheus/client_golang/api"
 	"github.com/redis/go-redis/v9"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
 	"github.com/llm-d/llm-d-async/api"
+	"github.com/llm-d/llm-d-async/pkg/async/inference/flowcontrol"
 )
 
 const (
@@ -33,6 +35,9 @@ const (
 	redisGateRequestQueue = "redis-gate-request-sortedset"
 	redisGateResultQueue  = "redis-gate-result-list"
 	dispatchGateBudgetKey = "dispatch-gate-budget"
+
+	oldDispatcherRequestQueue = "old-dispatcher-request-sortedset"
+	oldDispatcherResultQueue  = "old-dispatcher-result-list"
 
 	endpointScrapeRequestQueue = "endpoint-scrape-request-sortedset"
 	endpointScrapeResultQueue  = "endpoint-scrape-result-list"
@@ -208,7 +213,7 @@ func makeRequestMessage(id string, deadlineOffset time.Duration) api.RequestMess
 		ID:       id,
 		Created:  time.Now().Unix(),
 		Deadline: deadline.Unix(),
-		Payload:  map[string]any{"model": id, "prompt": "test"},
+		Payload:  testPayload(map[string]any{"model": id, "prompt": "test"}),
 	}
 }
 
@@ -300,7 +305,11 @@ func queryProm(promURL, query string) float64 {
 // must match the budget processor's gate-params in llm-d-async.yaml.
 // We use max_concurrency=1 so a single queued request in EPP's admission
 // layer is enough to drive the budget to zero.
-const budgetPromQL = `1 - (sum by(inference_pool)(inference_extension_flow_control_queue_size{inference_pool="e2e-pool"}) / on() (inference_pool_ready_pods{name="e2e-pool"} * 1))`
+func budgetPromQL(promURL string) string {
+	source, err := flowcontrol.NewFlowControlQueueSizePromQL(promapi.Config{Address: promURL}, "e2e-pool", 1, "")
+	gomega.Expect(err).NotTo(gomega.HaveOccurred())
+	return source.Expr()
+}
 
 // waitForBudget polls Prometheus using the same PromQL the budget gate uses.
 // It sends probe requests through Envoy to trigger EPP metric recording, then
@@ -309,7 +318,7 @@ const budgetPromQL = `1 - (sum by(inference_pool)(inference_extension_flow_contr
 func waitForBudget(promURL, envoyURL string, pred func(float64) bool) {
 	gomega.EventuallyWithOffset(1, func() bool {
 		sendProbeRequest(envoyURL)
-		v := queryProm(promURL, budgetPromQL)
+		v := queryProm(promURL, budgetPromQL(promURL))
 		return !math.IsNaN(v) && pred(v)
 	}, 60*time.Second, 2*time.Second).Should(gomega.BeTrue(), "waiting for budget to satisfy condition")
 }
@@ -327,7 +336,7 @@ func waitForSaturation(promURL, envoyURL string, pred func(float64) bool) {
 
 // floodProbes continuously sends concurrent inference requests through Envoy
 // to fill EPP's flow control admission queue. When EPP is saturated, these
-// requests queue up, driving inference_extension_flow_control_queue_size > 0.
+// requests queue up, driving llm_d_epp_flow_control_queue_size > 0.
 // Uses a long HTTP timeout so throttled requests stay in EPP's queue long
 // enough for Prometheus to scrape the non-zero queue_size.
 // Call the returned cancel function to stop the flood.
@@ -402,4 +411,12 @@ func setDispatchGateBudget(ctx context.Context, rdb *redis.Client, budget string
 
 func clearDispatchGateBudget(ctx context.Context, rdb *redis.Client) {
 	rdb.Del(ctx, dispatchGateBudgetKey) //nolint:errcheck
+}
+
+func testPayload(m map[string]any) json.RawMessage {
+	b, err := json.Marshal(m)
+	if err != nil {
+		panic(err)
+	}
+	return b
 }

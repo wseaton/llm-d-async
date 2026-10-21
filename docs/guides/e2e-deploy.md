@@ -13,21 +13,27 @@ backed by a real vLLM model server and the upstream llm-d stack.
 export LLM_D_REPO=/path/to/llm-d        # local checkout of github.com/llm-d/llm-d
 export ASYNC_REPO=/path/to/llm-d-async   # this repo
 export NAMESPACE=llm-d-async              # choose your namespace
-export GAIE_VERSION=v1.5.0
-export ROUTER_CHART_VERSION=v0.9.0
-export GATEWAY_API_VERSION=v1.5.1
+export GAIE_VERSION=v1.6.2
+export ROUTER_VERSION=main
+export ROUTER_CHART_VERSION=v0
+export GATEWAY_API_VERSION=v1.6.3
 export GUIDE_NAME=optimized-baseline
 ```
 
-`GAIE_VERSION` and `ROUTER_CHART_VERSION` track upstream; `${LLM_D_REPO}/guides/env.sh`
-is the source of truth for the versions the llm-d guides are tested against.
+`${LLM_D_REPO}/guides/env.sh` is the source of truth for these versions. `GAIE_VERSION`
+matches the inference-extension version the EPP image pins; `ROUTER_CHART_VERSION=v0`
+is the chart tag that deploys the `main`-tagged router image.
 
 ## Step 1: Install CRDs
 
 ```bash
 kubectl apply -k "https://github.com/kubernetes-sigs/gateway-api/config/crd?ref=${GATEWAY_API_VERSION}"
 kubectl apply -k "https://github.com/kubernetes-sigs/gateway-api-inference-extension/config/crd?ref=${GAIE_VERSION}"
+kubectl apply -k "https://github.com/llm-d/llm-d-router/config/crd?ref=${ROUTER_VERSION}"
 ```
+
+The llm-d router ships its own `llm-d.ai` CRDs (InferenceObjective and
+InferenceModelRewrite); GAIE v1.6 no longer includes them.
 
 ## Step 2: Create namespace
 
@@ -131,10 +137,12 @@ Verify EPP metrics are flowing into Prometheus:
 
 ```bash
 kubectl run --rm -i prom-check --image=curlimages/curl --restart=Never -n ${NAMESPACE} -- \
-    curl -s "http://llmd-kube-prometheus-stack-prometheus.llm-d-monitoring.svc.cluster.local:9090/api/v1/query?query=inference_pool_ready_pods"
+    curl -s --data-urlencode \
+    "query=llm_d_epp_ready_endpoints{name=\"optimized-baseline\",namespace=\"${NAMESPACE}\"}" \
+    'http://llmd-kube-prometheus-stack-prometheus.llm-d-monitoring.svc.cluster.local:9090/api/v1/query'
 ```
 
-Expected: `inference_pool_ready_pods{name="optimized-baseline"} = 1`
+Expected: one `llm_d_epp_ready_endpoints` series per scraped EPP replica, each reporting `1` ready model server for this guide.
 
 ## Step 8: Install Redis (or Valkey)
 
@@ -159,6 +167,7 @@ helm install redis bitnami/valkey -n redis --create-namespace --set auth.enabled
 ```bash
 helm install llm-d-async ${ASYNC_REPO}/charts/llm-d-async/ \
     -f ${ASYNC_REPO}/docs/guides/e2e-deploy/llm-d-async-values.yaml \
+    --set-string "ap.transportConfig.queues[0].gate_params.namespace=${NAMESPACE}" \
     -n ${NAMESPACE}
 ```
 
@@ -169,16 +178,18 @@ The values file (`docs/guides/e2e-deploy/llm-d-async-values.yaml`) configures:
   injects it as `REDIS_URL` (kept out of the pod args). This dev Redis is unauthenticated;
   for a **credentialed or production** Redis, reference an existing Secret instead with
   `ap.transportConfig.urlSecret: {name: <secret>, key: url}`
-- Gate: `prometheus-budget` with pool=`optimized-baseline`, max_concurrency=100, baseline=0.05 (per-queue).
+- Gate: `prometheus-budget` with pool=`optimized-baseline`, namespace=`${NAMESPACE}`, max_concurrency=100, baseline=0.05 (per-queue).
   `max_concurrency` is a **per ready pod** capacity — see [Size `max_concurrency` for your pool](#size-max_concurrency-for-your-pool)
   before reusing this value on your own model
 - Prometheus URL pointing to the cluster's `llmd-kube-prometheus-stack-prometheus` service
 
 > **Multi-namespace deployments:** If the cluster has multiple inference pools
 > with the same name in different namespaces, the `prometheus-budget` and
-> `prometheus-saturation` gate queries may match multiple time series and fail
-> with many-to-many matching errors. Add `namespace` to `gate_params` to scope
-> the queries:
+> `prometheus-saturation` gates need an explicit namespace to identify the pool.
+> Unscoped `prometheus-budget` sources return no samples when their metrics match
+> multiple namespaces; if no source resolves, the configured fallback applies
+> (default `0`). The install command above scopes the gate to `${NAMESPACE}`.
+> For a pool in a different namespace, set `namespace` in `gate_params`:
 > ```yaml
 > gate_params:
 >   pool: "optimized-baseline"
@@ -232,7 +243,7 @@ saturated and read the per-pod peak:
 ```bash
 kubectl run --rm -i prom-peak --image=curlimages/curl --restart=Never -n ${NAMESPACE} -- \
     curl -s --data-urlencode \
-    'query=max_over_time((sum(vllm:num_requests_running{inference_pool="optimized-baseline"}) / on() inference_pool_ready_pods{name="optimized-baseline"})[1h:])' \
+    "query=max_over_time((sum(vllm:num_requests_running{inference_pool=\"optimized-baseline\",namespace=\"${NAMESPACE}\"}) / on() max(llm_d_epp_ready_endpoints{name=\"optimized-baseline\",namespace=\"${NAMESPACE}\"}))[1h:])" \
     'http://llmd-kube-prometheus-stack-prometheus.llm-d-monitoring.svc.cluster.local:9090/api/v1/query'
 ```
 
@@ -262,14 +273,16 @@ kubectl logs -n ${NAMESPACE} -l app.kubernetes.io/name=llm-d-async --tail=20
 ```bash
 # EPP metrics in Prometheus
 kubectl run --rm -i prom-check --image=curlimages/curl --restart=Never -n ${NAMESPACE} -- \
-    curl -s "http://llmd-kube-prometheus-stack-prometheus.llm-d-monitoring.svc.cluster.local:9090/api/v1/query?query=inference_pool_ready_pods"
-# Expected: inference_pool_ready_pods{name="optimized-baseline"} = 1
+    curl -s --data-urlencode \
+    "query=llm_d_epp_ready_endpoints{name=\"optimized-baseline\",namespace=\"${NAMESPACE}\"}" \
+    'http://llmd-kube-prometheus-stack-prometheus.llm-d-monitoring.svc.cluster.local:9090/api/v1/query'
+# Expected: one series per scraped EPP replica, each reporting 1 ready model server.
 
 # Wait for vLLM metrics with inference_pool label to appear (via PodMonitor relabeling).
 # The entire process might take a couple of minutes.
 echo "Waiting for vLLM metrics with inference_pool label..."
 until kubectl run --rm -i prom-wait-$RANDOM --image=curlimages/curl --restart=Never -n ${NAMESPACE} -- \
-    curl -sf --data-urlencode 'query=count(vllm:num_requests_running{inference_pool="optimized-baseline"})' \
+    curl -sf --data-urlencode "query=count(vllm:num_requests_running{inference_pool=\"optimized-baseline\",namespace=\"${NAMESPACE}\"})" \
     'http://llmd-kube-prometheus-stack-prometheus.llm-d-monitoring.svc.cluster.local:9090/api/v1/query' \
     | grep -q '"result":\[{"metric"'; do
   echo "  not yet, retrying in 10s..."
@@ -282,14 +295,14 @@ echo "vLLM metrics available."
 # nothing, and source 0 needs EPP's flow control plugin.
 kubectl run --rm -i prom-budget --image=curlimages/curl --restart=Never -n ${NAMESPACE} -- \
     curl -s --data-urlencode \
-    'query=1 - (avg by(name)(inference_pool_per_pod_queue_size{name="optimized-baseline"}) / 100)' \
+    "query=1 - (avg by(name)(llm_d_epp_per_endpoint_queue_size{name=\"optimized-baseline\",namespace=\"${NAMESPACE}\"}) / 100)" \
     'http://llmd-kube-prometheus-stack-prometheus.llm-d-monitoring.svc.cluster.local:9090/api/v1/query'
 # Expected: value = 1
 
 # The vLLM fallback (source 2), which needs the relabeled inference_pool label
 kubectl run --rm -i prom-budget-vllm --image=curlimages/curl --restart=Never -n ${NAMESPACE} -- \
     curl -s --data-urlencode \
-    'query=1 - (sum(vllm:num_requests_running{inference_pool="optimized-baseline"}) / on() (inference_pool_ready_pods{name="optimized-baseline"} * 100))' \
+    "query=1 - (sum(vllm:num_requests_running{inference_pool=\"optimized-baseline\",namespace=\"${NAMESPACE}\"}) / on() (max(llm_d_epp_ready_endpoints{name=\"optimized-baseline\",namespace=\"${NAMESPACE}\"}) * 100))" \
     'http://llmd-kube-prometheus-stack-prometheus.llm-d-monitoring.svc.cluster.local:9090/api/v1/query'
 # Expected: value = 1
 ```
@@ -387,10 +400,16 @@ This test floods the inference gateway with interactive requests to saturate
 vLLM, then verifies that the dispatch budget gate closes and async requests
 queue. When the load stops, the gate re-opens and queued requests drain.
 
+The Redis probes below run a shell inside a pod. They pass `REDIS_HOST` with `--env`
+so that shell can resolve the Redis service configured on the host.
+
 Two load generators are available:
 - **hey** (`docs/guides/e2e-deploy/hey-loadtest.yaml`) — simple HTTP load generator, 200 concurrent workers
 - **guidellm** (`docs/guides/e2e-deploy/guidellm-loadtest.yaml`) — LLM-specific load testing with synthetic
-  prompts (256 prompt tokens, 512 output tokens), constant 50 req/s
+  prompts (256 prompt tokens, 512 output tokens), constant 50 req/s. The manifest pins guidellm v0.8.0 and
+  uses the `guidellm run` syntax introduced in v0.7.0 (`--backend`, `--profile`, `--constraint`, `--data`
+  with `kind=...` values); the older `guidellm benchmark run` flags no longer exist in any current image, so
+  do not switch it back to the `latest` tag
 
 #### Option A: hey
 
@@ -402,19 +421,20 @@ kubectl apply -n ${NAMESPACE} -f ${ASYNC_REPO}/docs/guides/e2e-deploy/hey-loadte
 sleep 20
 kubectl run --rm -i prom-running --image=curlimages/curl --restart=Never -n ${NAMESPACE} -- \
     curl -s --data-urlencode \
-    'query=vllm:num_requests_running{inference_pool="optimized-baseline"}' \
+    "query=vllm:num_requests_running{inference_pool=\"optimized-baseline\",namespace=\"${NAMESPACE}\"}" \
     'http://llmd-kube-prometheus-stack-prometheus.llm-d-monitoring.svc.cluster.local:9090/api/v1/query'
 # Expected: vllm:num_requests_running = 200 (saturated)
 
 # Verify budget is negative (gate closed)
 kubectl run --rm -i prom-budget --image=curlimages/curl --restart=Never -n ${NAMESPACE} -- \
     curl -s --data-urlencode \
-    'query=1 - (sum(vllm:num_requests_running{inference_pool="optimized-baseline"}) / on() (inference_pool_ready_pods{name="optimized-baseline"} * 100))' \
+    "query=1 - (sum(vllm:num_requests_running{inference_pool=\"optimized-baseline\",namespace=\"${NAMESPACE}\"}) / on() (max(llm_d_epp_ready_endpoints{name=\"optimized-baseline\",namespace=\"${NAMESPACE}\"}) * 100))" \
     'http://llmd-kube-prometheus-stack-prometheus.llm-d-monitoring.svc.cluster.local:9090/api/v1/query'
 # Expected: value = -1 (200 running / 100 max = 200% utilization)
 
 # 3. Push async requests while gate is closed
-kubectl run --rm -i push-async --image=redis --restart=Never -n ${NAMESPACE} -- \
+kubectl run --rm -i push-async --image=redis --restart=Never -n ${NAMESPACE} \
+    --env="REDIS_HOST=${REDIS_HOST}" -- \
     sh -c 'for i in 1 2 3 4 5; do
       redis-cli -h ${REDIS_HOST} ZADD request-sortedset 1999999999 \
         "{\"request_kind\":\"redis\",\"internal\":{},\"data\":{\"id\":\"sat-$i\",\"created\":1700000000,\"deadline\":1999999999,\"payload\":{\"model\":\"Qwen/Qwen3-0.6B\",\"prompt\":\"Count slowly.\",\"max_tokens\":128}}}"
@@ -422,7 +442,8 @@ kubectl run --rm -i push-async --image=redis --restart=Never -n ${NAMESPACE} -- 
 
 # 4. Verify requests stay queued (gate closed, no dispatch)
 sleep 10
-kubectl run --rm -i check-queued --image=redis --restart=Never -n ${NAMESPACE} -- \
+kubectl run --rm -i check-queued --image=redis --restart=Never -n ${NAMESPACE} \
+    --env="REDIS_HOST=${REDIS_HOST}" -- \
     sh -c 'echo "queue: $(redis-cli -h ${REDIS_HOST} ZCARD request-sortedset)"; echo "results: $(redis-cli -h ${REDIS_HOST} LLEN result-list)"'
 # Expected: queue: 5, results: 0
 
@@ -432,7 +453,8 @@ kubectl delete job hey-loadtest -n ${NAMESPACE}
 # Wait for Prometheus to scrape idle state + gate to open (~30s)
 sleep 30
 
-kubectl run --rm -i check-drained --image=redis --restart=Never -n ${NAMESPACE} -- \
+kubectl run --rm -i check-drained --image=redis --restart=Never -n ${NAMESPACE} \
+    --env="REDIS_HOST=${REDIS_HOST}" -- \
     sh -c 'echo "queue: $(redis-cli -h ${REDIS_HOST} ZCARD request-sortedset)"; echo "results: $(redis-cli -h ${REDIS_HOST} LLEN result-list)"'
 # Expected: queue: 0, results: 5
 ```
@@ -443,23 +465,26 @@ kubectl run --rm -i check-drained --image=redis --restart=Never -n ${NAMESPACE} 
 # 1. Start the load test (constant 50 req/s, synthetic data, runs until killed)
 kubectl apply -n ${NAMESPACE} -f ${ASYNC_REPO}/docs/guides/e2e-deploy/guidellm-loadtest.yaml
 
-# 2. Wait ~40s for startup + Prometheus scrape, then verify saturation
-sleep 40
+# 2. Wait for the job to start generating load (the first run pulls the image and the
+#    tokenizer), then one Prometheus scrape, then verify saturation
+kubectl wait --for=condition=Ready pod -l job-name=guidellm-loadtest -n ${NAMESPACE} --timeout=300s
+sleep 30
 kubectl run --rm -i prom-running --image=curlimages/curl --restart=Never -n ${NAMESPACE} -- \
     curl -s --data-urlencode \
-    'query=vllm:num_requests_running{inference_pool="optimized-baseline"}' \
+    "query=vllm:num_requests_running{inference_pool=\"optimized-baseline\",namespace=\"${NAMESPACE}\"}" \
     'http://llmd-kube-prometheus-stack-prometheus.llm-d-monitoring.svc.cluster.local:9090/api/v1/query'
 # Expected: vllm:num_requests_running ~= 110 (saturated)
 
 # Verify budget is negative (gate closed)
 kubectl run --rm -i prom-budget --image=curlimages/curl --restart=Never -n ${NAMESPACE} -- \
     curl -s --data-urlencode \
-    'query=1 - (sum(vllm:num_requests_running{inference_pool="optimized-baseline"}) / on() (inference_pool_ready_pods{name="optimized-baseline"} * 100))' \
+    "query=1 - (sum(vllm:num_requests_running{inference_pool=\"optimized-baseline\",namespace=\"${NAMESPACE}\"}) / on() (max(llm_d_epp_ready_endpoints{name=\"optimized-baseline\",namespace=\"${NAMESPACE}\"}) * 100))" \
     'http://llmd-kube-prometheus-stack-prometheus.llm-d-monitoring.svc.cluster.local:9090/api/v1/query'
 # Expected: value ~= -0.1 (gate closed)
 
 # 3. Push async requests while gate is closed
-kubectl run --rm -i push-async --image=redis --restart=Never -n ${NAMESPACE} -- \
+kubectl run --rm -i push-async --image=redis --restart=Never -n ${NAMESPACE} \
+    --env="REDIS_HOST=${REDIS_HOST}" -- \
     sh -c 'for i in 1 2 3 4 5; do
       redis-cli -h ${REDIS_HOST} ZADD request-sortedset 1999999999 \
         "{\"request_kind\":\"redis\",\"internal\":{},\"data\":{\"id\":\"gl-$i\",\"created\":1700000000,\"deadline\":1999999999,\"payload\":{\"model\":\"Qwen/Qwen3-0.6B\",\"prompt\":\"Count slowly.\",\"max_tokens\":128}}}"
@@ -467,7 +492,8 @@ kubectl run --rm -i push-async --image=redis --restart=Never -n ${NAMESPACE} -- 
 
 # 4. Verify requests stay queued (gate closed, no dispatch)
 sleep 10
-kubectl run --rm -i check-queued --image=redis --restart=Never -n ${NAMESPACE} -- \
+kubectl run --rm -i check-queued --image=redis --restart=Never -n ${NAMESPACE} \
+    --env="REDIS_HOST=${REDIS_HOST}" -- \
     sh -c 'echo "queue: $(redis-cli -h ${REDIS_HOST} ZCARD request-sortedset)"; echo "results: $(redis-cli -h ${REDIS_HOST} LLEN result-list)"'
 # Expected: queue: 5, results: 0
 
@@ -477,7 +503,8 @@ kubectl delete job guidellm-loadtest -n ${NAMESPACE}
 # Wait ~60s for vLLM to drain in-flight requests + Prometheus scrape + gate to open
 sleep 60
 
-kubectl run --rm -i check-drained --image=redis --restart=Never -n ${NAMESPACE} -- \
+kubectl run --rm -i check-drained --image=redis --restart=Never -n ${NAMESPACE} \
+    --env="REDIS_HOST=${REDIS_HOST}" -- \
     sh -c 'echo "queue: $(redis-cli -h ${REDIS_HOST} ZCARD request-sortedset)"; echo "results: $(redis-cli -h ${REDIS_HOST} LLEN result-list)"'
 # Expected: queue: 0, results: 5
 ```
